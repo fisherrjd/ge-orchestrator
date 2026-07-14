@@ -15,7 +15,7 @@ type Evaluation struct {
 	LowAgeS         *int            `json:"low_age_s"`
 	CurMargin       *int64          `json:"cur_margin"`
 	Vol30m          *int64          `json:"vol_30m"`
-	RealizedPer4hGp *int64          `json:"realized_per_4h_gp"`
+	RealizedPer1hGp *int64          `json:"realized_per_1h_gp"`
 	Checks          json.RawMessage `json:"checks"`
 	Verdict         string          `json:"verdict"`
 }
@@ -23,16 +23,16 @@ type Evaluation struct {
 func (s *Store) InsertEvaluation(ctx context.Context, e Evaluation) error {
 	_, err := s.Pool.Exec(ctx, `INSERT INTO orchestrator.evaluations
 		(strategy_id, at, cur_high, cur_low, high_age_s, low_age_s, cur_margin, vol_30m,
-		 realized_per_4h_gp, checks, verdict)
+		 realized_per_1h_gp, checks, verdict)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		e.StrategyID, e.At, e.CurHigh, e.CurLow, e.HighAgeS, e.LowAgeS, e.CurMargin, e.Vol30m,
-		e.RealizedPer4hGp, e.Checks, e.Verdict)
+		e.RealizedPer1hGp, e.Checks, e.Verdict)
 	return err
 }
 
 func (s *Store) Evaluations(ctx context.Context, strategyID int64, limit int) ([]Evaluation, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT strategy_id, at, cur_high, cur_low, high_age_s,
-		low_age_s, cur_margin, vol_30m, realized_per_4h_gp, checks, verdict
+		low_age_s, cur_margin, vol_30m, realized_per_1h_gp, checks, verdict
 		FROM orchestrator.evaluations WHERE strategy_id=$1 ORDER BY at DESC LIMIT $2`,
 		strategyID, limit)
 	if err != nil {
@@ -43,7 +43,7 @@ func (s *Store) Evaluations(ctx context.Context, strategyID int64, limit int) ([
 	for rows.Next() {
 		var e Evaluation
 		if err := rows.Scan(&e.StrategyID, &e.At, &e.CurHigh, &e.CurLow, &e.HighAgeS,
-			&e.LowAgeS, &e.CurMargin, &e.Vol30m, &e.RealizedPer4hGp, &e.Checks, &e.Verdict); err != nil {
+			&e.LowAgeS, &e.CurMargin, &e.Vol30m, &e.RealizedPer1hGp, &e.Checks, &e.Verdict); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -75,8 +75,8 @@ func (s *Store) LastVerdicts(ctx context.Context, strategyID int64, n int) ([]st
 func (s *Store) EvalStats(ctx context.Context, strategyID int64) (total, healthy int, medianRatio *float64, err error) {
 	err = s.Pool.QueryRow(ctx, `SELECT count(*),
 		count(*) FILTER (WHERE verdict='healthy'),
-		(percentile_cont(0.5) WITHIN GROUP (ORDER BY realized_per_4h_gp)
-		 / nullif((SELECT per_4h_gp FROM orchestrator.strategies WHERE strategy_id=$1), 0))::float8
+		(percentile_cont(0.5) WITHIN GROUP (ORDER BY realized_per_1h_gp)
+		 / nullif((SELECT per_1h_gp FROM orchestrator.strategies WHERE strategy_id=$1), 0))::float8
 		FROM orchestrator.evaluations WHERE strategy_id=$1`, strategyID).
 		Scan(&total, &healthy, &medianRatio)
 	return

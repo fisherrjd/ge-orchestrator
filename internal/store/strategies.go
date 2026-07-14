@@ -37,7 +37,7 @@ type SidecarStrategy struct {
 	} `json:"size"`
 	ExpectedValue struct {
 		PerCycleGp int64   `json:"per_cycle_gp"`
-		Per4hGp    int64   `json:"per_4h_gp"`
+		Per1hGp    int64   `json:"per_1h_gp"`
 		PerDayGp   int64   `json:"per_day_gp"`
 		RoiPct     float64 `json:"roi_pct"`
 	} `json:"expected_value"`
@@ -71,13 +71,13 @@ func (s *Store) InsertStrategies(ctx context.Context, runID int64, openedAt time
 		if _, err := tx.Exec(ctx, `INSERT INTO orchestrator.strategies
 			(run_id, sid, archetype, title, thesis, items, primary_item_id,
 			 entry_text, exit_text, entry_price, exit_price, kill_price, horizon_text,
-			 capital_required, units_used, per_cycle_gp, per_4h_gp, per_day_gp, roi_pct,
+			 capital_required, units_used, per_cycle_gp, per_1h_gp, per_day_gp, roi_pct,
 			 confidence, confidence_why, evidence, invalidation, risks, paper_trade, opened_at)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
 			runID, st.ID, st.Archetype, st.Title, st.Thesis, items, st.Items[0].ID,
 			st.Entry, st.Exit, st.EntryPrice, st.ExitPrice, st.KillPrice, st.Horizon,
 			st.CapitalRequired, st.Size.UnitsUsed,
-			st.ExpectedValue.PerCycleGp, st.ExpectedValue.Per4hGp, st.ExpectedValue.PerDayGp, st.ExpectedValue.RoiPct,
+			st.ExpectedValue.PerCycleGp, st.ExpectedValue.Per1hGp, st.ExpectedValue.PerDayGp, st.ExpectedValue.RoiPct,
 			st.Confidence, st.ConfidenceWhy, st.Evidence, st.Invalidation, risks, st.PaperTrade, openedAt,
 		); err != nil {
 			return fmt.Errorf("insert strategy %s: %w", st.ID, err)
@@ -104,7 +104,7 @@ type Strategy struct {
 	Capital       *int64          `json:"capital_required"`
 	UnitsUsed     *int64          `json:"units_used"`
 	PerCycleGp    *int64          `json:"per_cycle_gp"`
-	Per4hGp       *int64          `json:"per_4h_gp"`
+	Per1hGp       *int64          `json:"per_1h_gp"`
 	PerDayGp      *int64          `json:"per_day_gp"`
 	RoiPct        *float64        `json:"roi_pct"`
 	Confidence    string          `json:"confidence"`
@@ -120,7 +120,7 @@ type Strategy struct {
 
 const strategyCols = `strategy_id, run_id, sid, archetype, title, thesis, items, primary_item_id,
 	entry_text, exit_text, entry_price, exit_price, kill_price, horizon_text,
-	capital_required, units_used, per_cycle_gp, per_4h_gp, per_day_gp, roi_pct,
+	capital_required, units_used, per_cycle_gp, per_1h_gp, per_day_gp, roi_pct,
 	confidence, confidence_why, invalidation, risks, paper_trade,
 	state, state_reason, opened_at, closed_at`
 
@@ -129,7 +129,7 @@ func scanStrategy(row pgx.Row) (*Strategy, error) {
 	err := row.Scan(&st.StrategyID, &st.RunID, &st.Sid, &st.Archetype, &st.Title, &st.Thesis,
 		&st.Items, &st.PrimaryItemID, &st.EntryText, &st.ExitText, &st.EntryPrice, &st.ExitPrice,
 		&st.KillPrice, &st.HorizonText, &st.Capital, &st.UnitsUsed,
-		&st.PerCycleGp, &st.Per4hGp, &st.PerDayGp, &st.RoiPct,
+		&st.PerCycleGp, &st.Per1hGp, &st.PerDayGp, &st.RoiPct,
 		&st.Confidence, &st.ConfidenceWhy, &st.Invalidation, &st.Risks, &st.PaperTrade,
 		&st.State, &st.StateReason, &st.OpenedAt, &st.ClosedAt)
 	if err != nil {
@@ -164,7 +164,7 @@ func (s *Store) StrategiesForRun(ctx context.Context, runID int64) ([]Strategy, 
 func (s *Store) LatestRunStrategies(ctx context.Context) ([]Strategy, error) {
 	return s.collectStrategies(ctx, `SELECT `+strategyCols+` FROM orchestrator.strategies
 		WHERE run_id = (SELECT max(run_id) FROM orchestrator.runs WHERE status='succeeded')
-		ORDER BY per_4h_gp DESC NULLS LAST`)
+		ORDER BY per_1h_gp DESC NULLS LAST`)
 }
 
 func (s *Store) OpenStrategies(ctx context.Context) ([]Strategy, error) {

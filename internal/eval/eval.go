@@ -79,8 +79,9 @@ func (ev *Evaluator) Compute(ctx context.Context, st store.Strategy) (store.Eval
 	checks["legs_fresh"] = snap.highAgeS != nil && snap.lowAgeS != nil &&
 		*snap.highAgeS <= freshMaxAgeS && *snap.lowAgeS <= freshMaxAgeS
 
-	// margin_ok + realized value, archetype-dependent.
-	var realizedPer4h *int64
+	// margin_ok + realized value, archetype-dependent. Realized gp/1h = one
+	// full buy-limit cycle at current prices ÷ 4 (limits reset every 4h).
+	var realizedPer1h *int64
 	unitMargin := int64(0)
 	if st.PerCycleGp != nil && st.UnitsUsed != nil && *st.UnitsUsed > 0 {
 		unitMargin = *st.PerCycleGp / *st.UnitsUsed
@@ -93,8 +94,8 @@ func (ev *Evaluator) Compute(ctx context.Context, st store.Strategy) (store.Eval
 			gap := *snap.highalch - *snap.natLow - *snap.high
 			ok = gap > 0
 			if st.UnitsUsed != nil {
-				r := gap * *st.UnitsUsed
-				realizedPer4h = &r
+				r := gap * *st.UnitsUsed / 4
+				realizedPer1h = &r
 			}
 		}
 		checks["margin_ok"] = ok
@@ -103,8 +104,8 @@ func (ev *Evaluator) Compute(ctx context.Context, st store.Strategy) (store.Eval
 		if snap.margin != nil {
 			ok = float64(*snap.margin) >= marginOKFraction*float64(unitMargin)
 			if st.UnitsUsed != nil {
-				r := *snap.margin * *st.UnitsUsed
-				realizedPer4h = &r
+				r := *snap.margin * *st.UnitsUsed / 4
+				realizedPer1h = &r
 			}
 		}
 		checks["margin_ok"] = ok
@@ -159,7 +160,7 @@ func (ev *Evaluator) Compute(ctx context.Context, st store.Strategy) (store.Eval
 		CurHigh: snap.high, CurLow: snap.low,
 		HighAgeS: snap.highAgeS, LowAgeS: snap.lowAgeS,
 		CurMargin: snap.margin, Vol30m: &snap.vol30m,
-		RealizedPer4hGp: realizedPer4h, Checks: checksJSON, Verdict: verdict,
+		RealizedPer1hGp: realizedPer1h, Checks: checksJSON, Verdict: verdict,
 	}, checks, nil
 }
 

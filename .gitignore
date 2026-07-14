@@ -1,0 +1,10 @@
+.direnv/
+.env
+result*
+bin/
+state/
+
+# go
+*.exe
+*.test
+*.out

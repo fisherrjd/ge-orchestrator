@@ -1,0 +1,287 @@
+// Package api is the orchestrator's HTTP surface (JSON + SSE), consumed by
+// ge-dashboard. Localhost-only by default; the dashboard is the public face.
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/osrs-ge/ge-orchestrator/internal/brief"
+	"github.com/osrs-ge/ge-orchestrator/internal/eval"
+	"github.com/osrs-ge/ge-orchestrator/internal/runner"
+	"github.com/osrs-ge/ge-orchestrator/internal/store"
+)
+
+type Server struct {
+	Store     *store.Store
+	Runner    *runner.Runner
+	Evaluator *eval.Evaluator
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/runs", s.listRuns)
+	mux.HandleFunc("POST /api/runs", s.triggerRun)
+	mux.HandleFunc("GET /api/runs/{id}", s.getRun)
+	mux.HandleFunc("GET /api/runs/{id}/report", s.getReport)
+	mux.HandleFunc("GET /api/runs/{id}/events", s.streamEvents)
+	mux.HandleFunc("GET /api/strategies", s.listStrategies)
+	mux.HandleFunc("GET /api/strategies/{id}", s.getStrategy)
+	mux.HandleFunc("GET /api/scoreboard", s.scoreboard)
+	mux.HandleFunc("GET /api/brief/preview", s.briefPreview)
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	dbOK := s.Store.Pool.Ping(r.Context()) == nil
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": dbOK, "db": dbOK, "active_run_id": s.Runner.ActiveRunID(),
+	})
+}
+
+func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
+	limit := 20
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	runs, err := s.Store.Runs(r.Context(), limit)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, runs)
+}
+
+func (s *Server) triggerRun(w http.ResponseWriter, r *http.Request) {
+	p := brief.Defaults()
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, 400, "bad brief body: "+err.Error())
+		return
+	}
+	if err := p.Validate(); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	runID, err := s.Runner.Trigger(r.Context(), p)
+	if err == runner.ErrBusy {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "run in progress", "active_run_id": runID})
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"run_id": runID})
+}
+
+func (s *Server) runID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, 400, "bad id")
+		return 0, false
+	}
+	return id, true
+}
+
+func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.runID(w, r)
+	if !ok {
+		return
+	}
+	run, err := s.Store.Run(r.Context(), id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if run == nil {
+		writeErr(w, 404, "no such run")
+		return
+	}
+	strategies, err := s.Store.StrategiesForRun(r.Context(), id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"run": run, "strategies": strategies})
+}
+
+func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.runID(w, r)
+	if !ok {
+		return
+	}
+	md, err := s.Store.ReportMarkdown(r.Context(), id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if md == "" {
+		writeErr(w, 404, "no report for this run")
+		return
+	}
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Write([]byte(md))
+}
+
+// streamEvents is the SSE feed for a run, with Last-Event-ID replay.
+func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.runID(w, r)
+	if !ok {
+		return
+	}
+	lastID := 0
+	if v := r.Header.Get("Last-Event-ID"); v != "" {
+		lastID, _ = strconv.Atoi(v)
+	}
+
+	flusher, canFlush := w.(http.Flusher)
+	if !canFlush {
+		writeErr(w, 500, "streaming unsupported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	send := func(e runner.Event) {
+		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Type, e.Marshal())
+	}
+
+	replay, live := s.Runner.Hub.Subscribe(id, lastID)
+	for _, e := range replay {
+		send(e)
+	}
+	flusher.Flush()
+	if live == nil {
+		return // run already finished; replay was everything
+	}
+	defer s.Runner.Hub.Unsubscribe(id, live)
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case e, open := <-live:
+			if !open {
+				return
+			}
+			send(e)
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (s *Server) listStrategies(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var (
+		list []store.Strategy
+		err  error
+	)
+	switch q.Get("scope") {
+	case "", "latest_run":
+		list, err = s.Store.LatestRunStrategies(r.Context())
+	case "open":
+		list, err = s.Store.OpenStrategies(r.Context())
+	default:
+		writeErr(w, 400, "scope must be latest_run or open")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+
+	type liveStrategy struct {
+		store.Strategy
+		LiveChecks  map[string]bool `json:"live_checks,omitempty"`
+		LiveVerdict string          `json:"live_verdict,omitempty"`
+		Live        *store.Evaluation `json:"live,omitempty"`
+	}
+	out := make([]liveStrategy, 0, len(list))
+	for _, st := range list {
+		ls := liveStrategy{Strategy: st}
+		if q.Get("live") == "1" {
+			e, checks, err := s.Evaluator.Compute(r.Context(), st)
+			if err != nil {
+				log.Printf("api: live check %d: %v", st.StrategyID, err)
+			} else {
+				ls.LiveChecks, ls.LiveVerdict, ls.Live = checks, e.Verdict, &e
+			}
+		}
+		out = append(out, ls)
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) getStrategy(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.runID(w, r)
+	if !ok {
+		return
+	}
+	st, err := s.Store.StrategyByID(r.Context(), id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if st == nil {
+		writeErr(w, 404, "no such strategy")
+		return
+	}
+	evals, err := s.Store.Evaluations(r.Context(), id, 600)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"strategy": st, "evaluations": evals})
+}
+
+func (s *Server) scoreboard(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.Store.Scoreboard(r.Context())
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, rows)
+}
+
+func (s *Server) briefPreview(w http.ResponseWriter, r *http.Request) {
+	p := brief.Defaults()
+	if v := r.URL.Query().Get("params"); v != "" {
+		if err := json.Unmarshal([]byte(v), &p); err != nil {
+			writeErr(w, 400, "bad params: "+err.Error())
+			return
+		}
+	}
+	if err := p.Validate(); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	text, err := brief.Render(r.Context(), s.Store, p, time.Now().UTC())
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"brief_text": text})
+}

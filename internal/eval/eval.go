@@ -24,7 +24,6 @@ const (
 	killConsecutive   = 3    // kill_signal on N consecutive evals -> killed
 	confirmHealthyPct = 0.80
 	confirmRatioMin   = 0.5
-	natureRuneID      = 561
 )
 
 type Evaluator struct {
@@ -32,11 +31,9 @@ type Evaluator struct {
 }
 
 type snapshot struct {
-	high, low, margin       *int64
-	highAgeS, lowAgeS       *int
-	vol30m                  int64
-	natLow                  *int64 // latest nature rune low (archetype G)
-	highalch                *int64 // items.highalch of the primary item
+	high, low, margin *int64
+	highAgeS, lowAgeS *int
+	vol30m            int64
 }
 
 // Tick evaluates every open strategy once and applies state transitions.
@@ -79,45 +76,26 @@ func (ev *Evaluator) Compute(ctx context.Context, st store.Strategy) (store.Eval
 	checks["legs_fresh"] = snap.highAgeS != nil && snap.lowAgeS != nil &&
 		*snap.highAgeS <= freshMaxAgeS && *snap.lowAgeS <= freshMaxAgeS
 
-	// margin_ok + realized value, archetype-dependent. Realized gp/1h = one
-	// full buy-limit cycle at current prices ÷ 4 (limits reset every 4h).
+	// margin_ok + realized value. Realized gp/1h = one full buy-limit cycle
+	// at current prices ÷ 4 (limits reset every 4h).
 	var realizedPer1h *int64
 	unitMargin := int64(0)
 	if st.PerCycleGp != nil && st.UnitsUsed != nil && *st.UnitsUsed > 0 {
 		unitMargin = *st.PerCycleGp / *st.UnitsUsed
 	}
-	switch st.Archetype {
-	case "G":
-		// Alch gap: highalch - nature_low - cur_high still positive.
-		ok := false
-		if snap.highalch != nil && snap.natLow != nil && snap.high != nil {
-			gap := *snap.highalch - *snap.natLow - *snap.high
-			ok = gap > 0
-			if st.UnitsUsed != nil {
-				r := gap * *st.UnitsUsed / 4
-				realizedPer1h = &r
-			}
+	marginOK := false
+	if snap.margin != nil {
+		marginOK = float64(*snap.margin) >= marginOKFraction*float64(unitMargin)
+		if st.UnitsUsed != nil {
+			r := *snap.margin * *st.UnitsUsed / 4
+			realizedPer1h = &r
 		}
-		checks["margin_ok"] = ok
-	default:
-		ok := false
-		if snap.margin != nil {
-			ok = float64(*snap.margin) >= marginOKFraction*float64(unitMargin)
-			if st.UnitsUsed != nil {
-				r := *snap.margin * *st.UnitsUsed / 4
-				realizedPer1h = &r
-			}
-		}
-		checks["margin_ok"] = ok
 	}
+	checks["margin_ok"] = marginOK
 
 	// entry/exit reachable.
 	checks["entry_reachable"] = snap.low != nil && float64(*snap.low) <= float64(st.EntryPrice)*entryBand
-	if st.Archetype == "G" {
-		checks["exit_reachable"] = true // exit is the alch value, always "prints"
-	} else {
-		checks["exit_reachable"] = snap.high != nil && float64(*snap.high) >= float64(st.ExitPrice)*exitBand
-	}
+	checks["exit_reachable"] = snap.high != nil && float64(*snap.high) >= float64(st.ExitPrice)*exitBand
 
 	// kill_price: the model's own stop, on the primary item's relevant leg.
 	breached := false
@@ -228,16 +206,10 @@ func (ev *Evaluator) snapshot(ctx context.Context, itemID int) (*snapshot, error
 		v AS (
 		  SELECT coalesce(sum(coalesce(high_volume,0)+coalesce(low_volume,0)),0) AS vol_30m
 		  FROM prices_5m WHERE item_id = $1 AND ts > now() - interval '30 min'
-		),
-		nat AS (
-		  SELECT low FROM prices_1m WHERE item_id = $2 AND low IS NOT NULL
-		  ORDER BY ts DESC LIMIT 1
-		),
-		alch AS (SELECT highalch FROM items WHERE item_id = $1)
-		SELECT q.high, q.low, q.margin, q.high_age_s, q.low_age_s, v.vol_30m,
-		       (SELECT low FROM nat), (SELECT highalch::bigint FROM alch)
-		FROM q, v`, itemID, natureRuneID).
-		Scan(&s.high, &s.low, &s.margin, &s.highAgeS, &s.lowAgeS, &s.vol30m, &s.natLow, &s.highalch)
+		)
+		SELECT q.high, q.low, q.margin, q.high_age_s, q.low_age_s, v.vol_30m
+		FROM q, v`, itemID).
+		Scan(&s.high, &s.low, &s.margin, &s.highAgeS, &s.lowAgeS, &s.vol30m)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot item %d: %w", itemID, err)
 	}

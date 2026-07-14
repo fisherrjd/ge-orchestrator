@@ -20,14 +20,14 @@ type Params struct {
 	Risk          string             `json:"risk"` // low | medium | high
 	Members       *bool              `json:"members"`
 	MinConfidence string             `json:"min_confidence"`
-	Archetypes    map[string]float64 `json:"archetypes"` // A..G -> weight 0..2
+	Archetypes    map[string]float64 `json:"archetypes"` // A..F -> weight 0..2
 	Notes         string             `json:"notes"`
 }
 
 func Defaults() Params {
 	return Params{
 		CapitalGp: 100_000_000, Risk: "medium", MinConfidence: "medium",
-		Archetypes: map[string]float64{"A": 1, "B": 1, "C": 1, "D": 1, "E": 1, "F": 1, "G": 1},
+		Archetypes: map[string]float64{"A": 1, "B": 1, "C": 1, "D": 1, "E": 1, "F": 1},
 	}
 }
 
@@ -46,7 +46,7 @@ func (p *Params) Validate() error {
 		return fmt.Errorf("capital_gp must be positive")
 	}
 	for k, w := range p.Archetypes {
-		if len(k) != 1 || k[0] < 'A' || k[0] > 'G' {
+		if len(k) != 1 || k[0] < 'A' || k[0] > 'F' {
 			return fmt.Errorf("archetypes: unknown archetype %q", k)
 		}
 		if w < 0 || w > 2 {
@@ -75,7 +75,7 @@ func Render(ctx context.Context, s *store.Store, p Params, at time.Time) (string
 	fmt.Fprintf(&b, "- Minimum confidence to ship a strategy: %s.\n", p.MinConfidence)
 	if len(p.Archetypes) > 0 {
 		b.WriteString("- Archetype weights (0 = do not pitch it at all; >1 = favor):")
-		for _, a := range []string{"A", "B", "C", "D", "E", "F", "G"} {
+		for _, a := range []string{"A", "B", "C", "D", "E", "F"} {
 			if w, ok := p.Archetypes[a]; ok {
 				fmt.Fprintf(&b, " %s %.1f,", a, w)
 			}

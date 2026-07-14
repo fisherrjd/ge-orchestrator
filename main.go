@@ -56,16 +56,20 @@ func main() {
 	}
 	ev := &eval.Evaluator{Store: st}
 
-	// Evaluation ticker.
+	// Evaluation ticker (+ optional empty-portfolio auto-trigger).
 	evalEvery := durEnv("GE_ORCH_EVAL_INTERVAL", 5*time.Minute)
+	emptyCooldown := durEnv("GE_ORCH_TRIGGER_ON_EMPTY", 0) // 0 = disabled
 	go func() {
 		t := time.NewTicker(evalEvery)
 		defer t.Stop()
 		for range t.C {
 			ev.Tick(ctx)
+			if emptyCooldown > 0 {
+				maybeTriggerOnEmpty(ctx, st, r, emptyCooldown)
+			}
 		}
 	}()
-	log.Printf("evaluator: every %s", evalEvery)
+	log.Printf("evaluator: every %s (trigger-on-empty cooldown: %s)", evalEvery, emptyCooldown)
 
 	// Optional run schedule.
 	if sched := os.Getenv("GE_ORCH_SCHEDULE"); sched != "" {
@@ -93,6 +97,39 @@ func main() {
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// maybeTriggerOnEmpty starts a new research cycle when the portfolio has gone
+// empty — the natural re-research moment: nothing left to trade, and the
+// scoreboard has just absorbed whatever killed the last strategies. The
+// cooldown is anchored to the last run's start time in the DB, so restarts
+// don't re-trigger and manual runs count toward it. In a market where every
+// strategy dies in minutes, this converges to one run per cooldown period.
+func maybeTriggerOnEmpty(ctx context.Context, st *store.Store, r *runner.Runner, cooldown time.Duration) {
+	if r.ActiveRunID() != 0 {
+		return
+	}
+	open, err := st.OpenCount(ctx)
+	if err != nil || open > 0 {
+		return
+	}
+	last, err := st.LastRunStart(ctx)
+	if err != nil {
+		log.Printf("trigger-on-empty: %v", err)
+		return
+	}
+	if last != nil && time.Since(*last) < cooldown {
+		return
+	}
+	runID, err := r.Trigger(ctx, brief.Defaults())
+	if err == runner.ErrBusy {
+		return
+	}
+	if err != nil {
+		log.Printf("trigger-on-empty: %v", err)
+		return
+	}
+	log.Printf("trigger-on-empty: portfolio empty, started run %d", runID)
 }
 
 func mustEnv(key string) string {

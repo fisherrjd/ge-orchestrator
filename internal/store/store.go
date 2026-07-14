@@ -160,6 +160,22 @@ func (s *Store) Run(ctx context.Context, runID int64) (*Run, error) {
 	return &r, err
 }
 
+// OpenCount returns how many strategies are still open.
+func (s *Store) OpenCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM orchestrator.strategies WHERE state='open'`).Scan(&n)
+	return n, err
+}
+
+// LastRunStart returns the most recent run's start time (any status), nil if
+// no runs exist. Used as the auto-trigger cooldown anchor — DB-based so it
+// survives restarts and counts manual runs too.
+func (s *Store) LastRunStart(ctx context.Context) (*time.Time, error) {
+	var t *time.Time
+	err := s.Pool.QueryRow(ctx, `SELECT max(started_at) FROM orchestrator.runs`).Scan(&t)
+	return t, err
+}
+
 func (s *Store) ReportMarkdown(ctx context.Context, runID int64) (string, error) {
 	var md *string
 	err := s.Pool.QueryRow(ctx, `SELECT report_md FROM orchestrator.runs WHERE run_id=$1`, runID).Scan(&md)

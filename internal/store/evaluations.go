@@ -18,21 +18,22 @@ type Evaluation struct {
 	RealizedPer1hGp *int64          `json:"realized_per_1h_gp"`
 	Checks          json.RawMessage `json:"checks"`
 	Verdict         string          `json:"verdict"`
+	Detail          json.RawMessage `json:"detail,omitempty"`
 }
 
 func (s *Store) InsertEvaluation(ctx context.Context, e Evaluation) error {
 	_, err := s.Pool.Exec(ctx, `INSERT INTO orchestrator.evaluations
 		(strategy_id, at, cur_high, cur_low, high_age_s, low_age_s, cur_margin, vol_30m,
-		 realized_per_1h_gp, checks, verdict)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		 realized_per_1h_gp, checks, verdict, detail)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		e.StrategyID, e.At, e.CurHigh, e.CurLow, e.HighAgeS, e.LowAgeS, e.CurMargin, e.Vol30m,
-		e.RealizedPer1hGp, e.Checks, e.Verdict)
+		e.RealizedPer1hGp, e.Checks, e.Verdict, e.Detail)
 	return err
 }
 
 func (s *Store) Evaluations(ctx context.Context, strategyID int64, limit int) ([]Evaluation, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT strategy_id, at, cur_high, cur_low, high_age_s,
-		low_age_s, cur_margin, vol_30m, realized_per_1h_gp, checks, verdict
+		low_age_s, cur_margin, vol_30m, realized_per_1h_gp, checks, verdict, detail
 		FROM orchestrator.evaluations WHERE strategy_id=$1 ORDER BY at DESC LIMIT $2`,
 		strategyID, limit)
 	if err != nil {
@@ -43,12 +44,21 @@ func (s *Store) Evaluations(ctx context.Context, strategyID int64, limit int) ([
 	for rows.Next() {
 		var e Evaluation
 		if err := rows.Scan(&e.StrategyID, &e.At, &e.CurHigh, &e.CurLow, &e.HighAgeS,
-			&e.LowAgeS, &e.CurMargin, &e.Vol30m, &e.RealizedPer1hGp, &e.Checks, &e.Verdict); err != nil {
+			&e.LowAgeS, &e.CurMargin, &e.Vol30m, &e.RealizedPer1hGp, &e.Checks, &e.Verdict, &e.Detail); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// LastEvalAt returns the newest evaluation time for a strategy (nil if none).
+// The ticker uses it to honor per-kind cadences (H evaluates hourly).
+func (s *Store) LastEvalAt(ctx context.Context, strategyID int64) (*time.Time, error) {
+	var t *time.Time
+	err := s.Pool.QueryRow(ctx, `SELECT max(at) FROM orchestrator.evaluations
+		WHERE strategy_id=$1`, strategyID).Scan(&t)
+	return t, err
 }
 
 // LastVerdicts returns the most recent n verdicts, newest first.
@@ -71,13 +81,14 @@ func (s *Store) LastVerdicts(ctx context.Context, strategyID int64, n int) ([]st
 }
 
 // EvalStats supports the confirmation rule: share of healthy evals + median
-// realized/projected over the strategy's whole evaluation history.
-func (s *Store) EvalStats(ctx context.Context, strategyID int64) (total, healthy int, medianRatio *float64, err error) {
+// realized/projected since the given anchor (a V strategy's armed ticks must
+// not count toward its confirmation — pass triggered_at; zero time = all).
+func (s *Store) EvalStats(ctx context.Context, strategyID int64, since time.Time) (total, healthy int, medianRatio *float64, err error) {
 	err = s.Pool.QueryRow(ctx, `SELECT count(*),
 		count(*) FILTER (WHERE verdict='healthy'),
 		(percentile_cont(0.5) WITHIN GROUP (ORDER BY realized_per_1h_gp)
 		 / nullif((SELECT per_1h_gp FROM orchestrator.strategies WHERE strategy_id=$1), 0))::float8
-		FROM orchestrator.evaluations WHERE strategy_id=$1`, strategyID).
+		FROM orchestrator.evaluations WHERE strategy_id=$1 AND at >= $2`, strategyID, since).
 		Scan(&total, &healthy, &medianRatio)
 	return
 }
@@ -89,11 +100,12 @@ type ScoreboardRow struct {
 	Killed              int      `json:"killed"`
 	Expired             int      `json:"expired"`
 	Open                int      `json:"open"`
+	Armed               int      `json:"armed"`
 	RealizedVsProjected *float64 `json:"realized_vs_projected"`
 }
 
 func (s *Store) Scoreboard(ctx context.Context) ([]ScoreboardRow, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT archetype, n, confirmed, killed, expired, open,
+	rows, err := s.Pool.Query(ctx, `SELECT archetype, n, confirmed, killed, expired, open, armed,
 		realized_vs_projected::float8 FROM orchestrator.scoreboard ORDER BY archetype`)
 	if err != nil {
 		return nil, err
@@ -102,7 +114,7 @@ func (s *Store) Scoreboard(ctx context.Context) ([]ScoreboardRow, error) {
 	var out []ScoreboardRow
 	for rows.Next() {
 		var r ScoreboardRow
-		if err := rows.Scan(&r.Archetype, &r.N, &r.Confirmed, &r.Killed, &r.Expired, &r.Open, &r.RealizedVsProjected); err != nil {
+		if err := rows.Scan(&r.Archetype, &r.N, &r.Confirmed, &r.Killed, &r.Expired, &r.Open, &r.Armed, &r.RealizedVsProjected); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

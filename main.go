@@ -14,6 +14,7 @@ import (
 
 	"github.com/osrs-ge/ge-orchestrator/internal/api"
 	"github.com/osrs-ge/ge-orchestrator/internal/brief"
+	"github.com/osrs-ge/ge-orchestrator/internal/collect"
 	"github.com/osrs-ge/ge-orchestrator/internal/eval"
 	"github.com/osrs-ge/ge-orchestrator/internal/runner"
 	"github.com/osrs-ge/ge-orchestrator/internal/store"
@@ -70,6 +71,28 @@ func main() {
 		}
 	}()
 	log.Printf("evaluator: every %s (trigger-on-empty cooldown: %s)", evalEvery, emptyCooldown)
+
+	// Trend collector: deterministic full-market sweeps on their own ticker.
+	// New signals can trigger a research run (with its own cooldown) so the
+	// system reacts to fresh anomalies without waiting for the schedule.
+	collectEvery := durEnv("GE_ORCH_COLLECT_INTERVAL", time.Hour)
+	signalCooldown := durEnv("GE_ORCH_SIGNAL_COOLDOWN", 30*time.Minute)
+	if collectEvery > 0 {
+		col := &collect.Collector{Store: st}
+		go func() {
+			// One sweep shortly after boot so a fresh install has trends/signals.
+			time.Sleep(30 * time.Second)
+			for {
+				n := col.Cycle(ctx)
+				if n > 0 {
+					log.Printf("collector: %d new signal(s)", n)
+					maybeTriggerOnSignals(ctx, st, r, signalCooldown)
+				}
+				time.Sleep(collectEvery)
+			}
+		}()
+		log.Printf("collector: every %s (signal-run cooldown: %s)", collectEvery, signalCooldown)
+	}
 
 	// Optional run schedule.
 	if sched := os.Getenv("GE_ORCH_SCHEDULE"); sched != "" {
@@ -130,6 +153,32 @@ func maybeTriggerOnEmpty(ctx context.Context, st *store.Store, r *runner.Runner,
 		return
 	}
 	log.Printf("trigger-on-empty: portfolio empty, started run %d", runID)
+}
+
+// maybeTriggerOnSignals starts a research run when the collector queued new
+// signals — the reaction-speed path. Same DB-anchored cooldown discipline as
+// trigger-on-empty so restarts and manual runs count toward it.
+func maybeTriggerOnSignals(ctx context.Context, st *store.Store, r *runner.Runner, cooldown time.Duration) {
+	if r.ActiveRunID() != 0 {
+		return
+	}
+	last, err := st.LastRunStart(ctx)
+	if err != nil {
+		log.Printf("trigger-on-signals: %v", err)
+		return
+	}
+	if last != nil && time.Since(*last) < cooldown {
+		return
+	}
+	runID, err := r.Trigger(ctx, brief.Defaults())
+	if err == runner.ErrBusy {
+		return
+	}
+	if err != nil {
+		log.Printf("trigger-on-signals: %v", err)
+		return
+	}
+	log.Printf("trigger-on-signals: new signals queued, started run %d", runID)
 }
 
 func mustEnv(key string) string {

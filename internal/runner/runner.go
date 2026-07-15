@@ -65,13 +65,28 @@ func (r *Runner) Trigger(ctx context.Context, p brief.Params) (int64, error) {
 		return r.active.runID, ErrBusy
 	}
 
-	briefText, err := brief.Render(ctx, r.Store, p, time.Now().UTC())
+	// Pull the oldest pending signals into this run's brief — the work-queue
+	// mechanism that makes consecutive runs investigate different candidates.
+	assigned, err := r.Store.PendingSignals(ctx, 10)
+	if err != nil {
+		return 0, err
+	}
+	briefText, err := brief.Render(ctx, r.Store, p, time.Now().UTC(), assigned)
 	if err != nil {
 		return 0, err
 	}
 	runID, err := r.Store.CreateRun(ctx, brief.MarshalParams(p), briefText)
 	if err != nil {
 		return 0, err
+	}
+	if len(assigned) > 0 {
+		ids := make([]int64, len(assigned))
+		for i, sig := range assigned {
+			ids[i] = sig.SignalID
+		}
+		if err := r.Store.AssignSignals(ctx, runID, ids); err != nil {
+			return 0, err
+		}
 	}
 
 	workspace := filepath.Join(r.Cfg.StateDir, "runs", fmt.Sprintf("%d", runID))
@@ -189,11 +204,24 @@ func (r *Runner) ingest(ctx context.Context, runID int64, workspace, reportPath 
 	if err := r.Store.InsertStrategies(ctx, runID, now, sc.Strategies); err != nil {
 		return err
 	}
+	// Apply the run's verdicts on its assigned signals, then return any it
+	// ignored to the queue (a verdict-less signal must not rot as 'assigned').
+	for _, v := range sc.SignalVerdicts {
+		if err := r.Store.ResolveSignal(ctx, int64(v.SignalID), v.Verdict, v.Reason); err != nil {
+			log.Printf("run %d: resolve signal %d: %v", runID, v.SignalID, err)
+		}
+	}
+	if err := r.Store.ReleaseRunSignals(ctx, runID); err != nil {
+		log.Printf("run %d: release unanswered signals: %v", runID, err)
+	}
 	return r.Store.FinishRun(ctx, runID, "succeeded", full, string(md), "")
 }
 
 func (r *Runner) fail(ctx context.Context, runID int64, reason string) {
 	log.Printf("run %d failed: %s", runID, reason)
+	if err := r.Store.ReleaseRunSignals(ctx, runID); err != nil {
+		log.Printf("run %d: release signals: %v", runID, err)
+	}
 	if err := r.Store.FinishRun(ctx, runID, "failed", "", "", reason); err != nil {
 		log.Printf("run %d: record failure: %v", runID, err)
 	}

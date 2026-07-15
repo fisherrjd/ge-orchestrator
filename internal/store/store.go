@@ -160,10 +160,12 @@ func (s *Store) Run(ctx context.Context, runID int64) (*Run, error) {
 	return &r, err
 }
 
-// OpenCount returns how many strategies are still open.
+// OpenCount returns how many strategies are still live (open or armed —
+// an armed V strategy is a position-in-waiting, so the portfolio is not
+// empty while one exists).
 func (s *Store) OpenCount(ctx context.Context) (int, error) {
 	var n int
-	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM orchestrator.strategies WHERE state='open'`).Scan(&n)
+	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM orchestrator.strategies WHERE state IN ('open','armed')`).Scan(&n)
 	return n, err
 }
 

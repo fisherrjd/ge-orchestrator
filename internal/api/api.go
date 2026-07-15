@@ -34,6 +34,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/strategies/{id}", s.getStrategy)
 	mux.HandleFunc("GET /api/scoreboard", s.scoreboard)
 	mux.HandleFunc("GET /api/brief/preview", s.briefPreview)
+	mux.HandleFunc("GET /api/signals", s.listSignals)
+	mux.HandleFunc("GET /api/trends", s.listTrends)
 	return mux
 }
 
@@ -203,7 +205,7 @@ func (s *Server) listStrategies(w http.ResponseWriter, r *http.Request) {
 	case "", "latest_run":
 		list, err = s.Store.LatestRunStrategies(r.Context())
 	case "open":
-		list, err = s.Store.OpenStrategies(r.Context())
+		list, err = s.Store.EvaluableStrategies(r.Context()) // open + armed
 	default:
 		writeErr(w, 400, "scope must be latest_run or open")
 		return
@@ -278,10 +280,47 @@ func (s *Server) briefPreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	text, err := brief.Render(r.Context(), s.Store, p, time.Now().UTC())
+	// Preview with the signals a real trigger would assign right now.
+	pending, err := s.Store.PendingSignals(r.Context(), 10)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	text, err := brief.Render(r.Context(), s.Store, p, time.Now().UTC(), pending)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	writeJSON(w, 200, map[string]string{"brief_text": text})
+}
+
+func (s *Server) listSignals(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	list, err := s.Store.Signals(r.Context(), limit)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, list)
+}
+
+func (s *Server) listTrends(w http.ResponseWriter, r *http.Request) {
+	lens := r.URL.Query().Get("lens")
+	switch lens {
+	case "seasonal", "volume", "band":
+	default:
+		writeErr(w, 400, "lens must be seasonal, volume or band")
+		return
+	}
+	list, err := s.Store.LatestTrends(r.Context(), lens, 25)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, list)
 }

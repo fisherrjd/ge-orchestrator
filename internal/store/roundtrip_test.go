@@ -82,7 +82,7 @@ func TestSidecarRoundTrip(t *testing.T) {
 	if len(sc.SignalVerdicts) != 1 {
 		t.Fatal("signal_verdicts should parse")
 	}
-	if err := s.InsertStrategies(ctx, runID, time.Now().UTC(), sc.Strategies); err != nil {
+	if err := s.InsertStrategies(ctx, runID, time.Now().UTC(), sc.Strategies, nil); err != nil {
 		t.Fatal(err)
 	}
 

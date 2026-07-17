@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -33,6 +34,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/strategies", s.listStrategies)
 	mux.HandleFunc("GET /api/strategies/{id}", s.getStrategy)
 	mux.HandleFunc("GET /api/scoreboard", s.scoreboard)
+	mux.HandleFunc("GET /api/pnl", s.pnl)
 	mux.HandleFunc("GET /api/brief/preview", s.briefPreview)
 	mux.HandleFunc("GET /api/signals", s.listSignals)
 	mux.HandleFunc("GET /api/trends", s.listTrends)
@@ -266,6 +268,71 @@ func (s *Server) scoreboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, rows)
+}
+
+// pnl is the proof-of-work view: what following every paper-traded strategy
+// would have printed, rolled up. Estimates inherit the evaluator's haircut
+// and are upper bounds — but they are the honest answer to "is the research
+// making money on paper yet".
+func (s *Server) pnl(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.Store.PnL(r.Context())
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+
+	type bucket struct {
+		N             int   `json:"n"`
+		EstRealizedGp int64 `json:"est_realized_gp"`
+		ProjectedGp   int64 `json:"projected_gp"`
+	}
+	total := bucket{}
+	byState := map[string]*bucket{}
+	byArchetype := map[string]*bucket{}
+	add := func(m map[string]*bucket, key string, row store.PnLRow) {
+		b := m[key]
+		if b == nil {
+			b = &bucket{}
+			m[key] = b
+		}
+		b.N++
+		if row.EstRealizedGp != nil {
+			b.EstRealizedGp += *row.EstRealizedGp
+		}
+		if row.ProjectedGp != nil {
+			b.ProjectedGp += *row.ProjectedGp
+		}
+	}
+	for _, row := range rows {
+		total.N++
+		if row.EstRealizedGp != nil {
+			total.EstRealizedGp += *row.EstRealizedGp
+		}
+		if row.ProjectedGp != nil {
+			total.ProjectedGp += *row.ProjectedGp
+		}
+		add(byState, row.State, row)
+		add(byArchetype, row.Archetype, row)
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
+		vi, vj := int64(0), int64(0)
+		if rows[i].EstRealizedGp != nil {
+			vi = *rows[i].EstRealizedGp
+		}
+		if rows[j].EstRealizedGp != nil {
+			vj = *rows[j].EstRealizedGp
+		}
+		return vi > vj
+	})
+
+	writeJSON(w, 200, map[string]any{
+		"as_of":        time.Now().UTC(),
+		"total":        total,
+		"by_state":     byState,
+		"by_archetype": byArchetype,
+		"strategies":   rows,
+	})
 }
 
 func (s *Server) briefPreview(w http.ResponseWriter, r *http.Request) {

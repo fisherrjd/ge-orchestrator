@@ -52,8 +52,9 @@ func main() {
 			Directive: mustEnv("GE_AGENT_DIRECTIVE"),
 			StateDir:  getenv("GE_ORCH_STATE", "state"),
 		},
-		Store: st,
-		Hub:   runner.NewHub(),
+		Store:  st,
+		Hub:    runner.NewHub(),
+		Prices: eval.NewPgSource(st.Pool),
 	}
 	ev := &eval.Evaluator{Store: st}
 

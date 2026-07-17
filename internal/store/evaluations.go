@@ -101,11 +101,12 @@ type ScoreboardRow struct {
 	Expired             int      `json:"expired"`
 	Open                int      `json:"open"`
 	Armed               int      `json:"armed"`
+	Vetoed              int      `json:"vetoed"`
 	RealizedVsProjected *float64 `json:"realized_vs_projected"`
 }
 
 func (s *Store) Scoreboard(ctx context.Context) ([]ScoreboardRow, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT archetype, n, confirmed, killed, expired, open, armed,
+	rows, err := s.Pool.Query(ctx, `SELECT archetype, n, confirmed, killed, expired, open, armed, vetoed,
 		realized_vs_projected::float8 FROM orchestrator.scoreboard ORDER BY archetype`)
 	if err != nil {
 		return nil, err
@@ -114,8 +115,70 @@ func (s *Store) Scoreboard(ctx context.Context) ([]ScoreboardRow, error) {
 	var out []ScoreboardRow
 	for rows.Next() {
 		var r ScoreboardRow
-		if err := rows.Scan(&r.Archetype, &r.N, &r.Confirmed, &r.Killed, &r.Expired, &r.Open, &r.Armed, &r.RealizedVsProjected); err != nil {
+		if err := rows.Scan(&r.Archetype, &r.N, &r.Confirmed, &r.Killed, &r.Expired, &r.Open, &r.Armed, &r.Vetoed, &r.RealizedVsProjected); err != nil {
 			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// PnLRow is one strategy's paper-trade estimate: the median haircut
+// realized_per_1h over its evaluated life × hours in that life. It is an
+// ESTIMATE of what following the strategy would have printed, not a ledger —
+// upper-bounded like every paper number (see package eval's honesty rules).
+type PnLRow struct {
+	StrategyID    int64      `json:"strategy_id"`
+	Sid           string     `json:"sid"`
+	Title         string     `json:"title"`
+	Archetype     string     `json:"archetype"`
+	State         string     `json:"state"`
+	OpenedAt      time.Time  `json:"opened_at"`
+	ClosedAt      *time.Time `json:"closed_at,omitempty"`
+	Hours         float64    `json:"hours"`
+	MedRealized1h *float64   `json:"med_realized_per_1h_gp"`
+	EstRealizedGp *int64     `json:"est_realized_gp"`
+	ProjectedGp   *int64     `json:"projected_gp"`
+	Capital       *int64     `json:"capital_required"`
+}
+
+// PnL returns per-strategy paper-trade estimates for every strategy that has
+// actually been evaluated: vetoed rows and never-triggered armed rows are
+// excluded (they were never trading). Hours run from the eval-clock anchor
+// (triggered_at for fired Vs, opened_at otherwise) to closed_at or now.
+func (s *Store) PnL(ctx context.Context) ([]PnLRow, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT s.strategy_id, s.sid, s.title, s.archetype, s.state,
+		s.opened_at, s.closed_at,
+		greatest(extract(epoch from (coalesce(s.closed_at, now()) - coalesce(s.triggered_at, s.opened_at)))/3600.0, 0)::float8 AS hours,
+		est.med_1h::float8, s.per_1h_gp, s.capital_required
+		FROM orchestrator.strategies s
+		JOIN LATERAL (
+			SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY e.realized_per_1h_gp) AS med_1h
+			FROM orchestrator.evaluations e
+			WHERE e.strategy_id = s.strategy_id
+			  AND (s.triggered_at IS NULL OR e.at >= s.triggered_at)
+		) est ON true
+		WHERE s.state <> 'vetoed' AND NOT (s.state = 'armed' AND s.triggered_at IS NULL)
+		ORDER BY s.strategy_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PnLRow
+	for rows.Next() {
+		var r PnLRow
+		var per1h *int64
+		if err := rows.Scan(&r.StrategyID, &r.Sid, &r.Title, &r.Archetype, &r.State,
+			&r.OpenedAt, &r.ClosedAt, &r.Hours, &r.MedRealized1h, &per1h, &r.Capital); err != nil {
+			return nil, err
+		}
+		if r.MedRealized1h != nil {
+			v := int64(*r.MedRealized1h * r.Hours)
+			r.EstRealizedGp = &v
+		}
+		if per1h != nil {
+			v := int64(float64(*per1h) * r.Hours)
+			r.ProjectedGp = &v
 		}
 		out = append(out, r)
 	}

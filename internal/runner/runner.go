@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/osrs-ge/ge-orchestrator/internal/brief"
+	"github.com/osrs-ge/ge-orchestrator/internal/eval"
 	"github.com/osrs-ge/ge-orchestrator/internal/store"
 )
 
@@ -31,17 +32,19 @@ type Config struct {
 }
 
 type Runner struct {
-	Cfg   Config
-	Store *store.Store
-	Hub   *Hub
+	Cfg    Config
+	Store  *store.Store
+	Hub    *Hub
+	Prices eval.PriceSource // ship-time vetting; nil skips the kill-price rule
 
 	mu     sync.Mutex
 	active *activeRun
 }
 
 type activeRun struct {
-	runID int64
-	done  chan struct{}
+	runID  int64
+	params brief.Params
+	done   chan struct{}
 }
 
 // ActiveRunID returns the in-flight run id, or 0.
@@ -98,7 +101,7 @@ func (r *Runner) Trigger(ctx context.Context, p brief.Params) (int64, error) {
 		return 0, err
 	}
 
-	run := &activeRun{runID: runID, done: make(chan struct{})}
+	run := &activeRun{runID: runID, params: p, done: make(chan struct{})}
 	r.active = run
 	go r.execute(runID, workspace, briefPath, run)
 	return runID, nil
@@ -173,7 +176,7 @@ func (r *Runner) execute(runID int64, workspace, briefPath string, run *activeRu
 		return
 	}
 
-	if err := r.ingest(ctx, runID, workspace, reportPath); err != nil {
+	if err := r.ingest(ctx, runID, run.params, workspace, reportPath); err != nil {
 		r.fail(ctx, runID, "ingest: "+err.Error())
 		return
 	}
@@ -182,7 +185,7 @@ func (r *Runner) execute(runID int64, workspace, briefPath string, run *activeRu
 }
 
 // ingest stores the report markdown + parses the sidecar strategies.
-func (r *Runner) ingest(ctx context.Context, runID int64, workspace, reportPath string) error {
+func (r *Runner) ingest(ctx context.Context, runID int64, p brief.Params, workspace, reportPath string) error {
 	full := reportPath
 	if !filepath.IsAbs(full) {
 		full = filepath.Join(workspace, reportPath)
@@ -201,7 +204,12 @@ func (r *Runner) ingest(ctx context.Context, runID int64, workspace, reportPath 
 		return fmt.Errorf("parse sidecar: %w", err)
 	}
 	now := time.Now().UTC()
-	if err := r.Store.InsertStrategies(ctx, runID, now, sc.Strategies); err != nil {
+	accepted, vetoed := r.vet(ctx, p, sc.Strategies)
+	for _, v := range vetoed {
+		log.Printf("run %d: strategy %s %s", runID, v.Strategy.ID, v.Reason)
+		r.Hub.Publish(runID, Event{Type: "vetoed", Data: map[string]any{"sid": v.Strategy.ID, "reason": v.Reason}})
+	}
+	if err := r.Store.InsertStrategies(ctx, runID, now, accepted, vetoed); err != nil {
 		return err
 	}
 	// Apply the run's verdicts on its assigned signals, then return any it

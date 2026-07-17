@@ -35,6 +35,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/strategies/{id}", s.getStrategy)
 	mux.HandleFunc("GET /api/scoreboard", s.scoreboard)
 	mux.HandleFunc("GET /api/pnl", s.pnl)
+	mux.HandleFunc("GET /api/watchlist", s.listWatchlist)
+	mux.HandleFunc("POST /api/watchlist", s.addWatch)
+	mux.HandleFunc("DELETE /api/watchlist/{id}", s.retireWatch)
 	mux.HandleFunc("GET /api/brief/preview", s.briefPreview)
 	mux.HandleFunc("GET /api/signals", s.listSignals)
 	mux.HandleFunc("GET /api/trends", s.listTrends)
@@ -359,6 +362,83 @@ func (s *Server) briefPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"brief_text": text})
+}
+
+func (s *Server) listWatchlist(w http.ResponseWriter, r *http.Request) {
+	list, err := s.Store.WatchRanked(r.Context(), 100)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, list)
+}
+
+// addWatch is the operator's entry point: "this item is good, keep it on the
+// stack." Accepts an item id or an exact (case-insensitive) name; archetype
+// optional (empty = the idea isn't tied to one kind).
+func (s *Server) addWatch(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ItemID    int    `json:"item_id"`
+		Name      string `json:"name"`
+		Archetype string `json:"archetype"`
+		Note      string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "bad body: "+err.Error())
+		return
+	}
+	switch body.Archetype {
+	case "", "S", "V", "C", "U", "H":
+	default:
+		writeErr(w, 400, "archetype must be S, V, C, U, H or empty")
+		return
+	}
+	var (
+		itemID int
+		name   string
+		err    error
+	)
+	switch {
+	case body.ItemID != 0:
+		itemID = body.ItemID
+		if name, err = s.Store.ItemName(r.Context(), itemID); err != nil {
+			writeErr(w, 404, fmt.Sprintf("unknown item_id %d", itemID))
+			return
+		}
+	case body.Name != "":
+		if itemID, name, err = s.Store.LookupItem(r.Context(), body.Name); err != nil {
+			writeErr(w, 404, fmt.Sprintf("no item named %q (exact match required)", body.Name))
+			return
+		}
+	default:
+		writeErr(w, 400, "item_id or name required")
+		return
+	}
+	var archetype, note *string
+	if body.Archetype != "" {
+		archetype = &body.Archetype
+	}
+	if body.Note != "" {
+		note = &body.Note
+	}
+	id, err := s.Store.UpsertWatch(r.Context(), itemID, name, archetype, note, "operator")
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"watch_id": id, "item_id": itemID, "item_name": name})
+}
+
+func (s *Server) retireWatch(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.runID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.Store.RetireWatch(r.Context(), id); err != nil {
+		writeErr(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"retired": id})
 }
 
 func (s *Server) listSignals(w http.ResponseWriter, r *http.Request) {

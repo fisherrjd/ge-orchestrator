@@ -99,6 +99,7 @@ func Render(ctx context.Context, s *store.Store, p Params, at time.Time, assigne
 	b.WriteString("- Objective: reliable gp/day. Prefer the boring, repeatable, high-confidence edge over the bigger speculative one; ship fewer, stronger strategies.\n")
 
 	writeOpenBook(ctx, &b, s, p)
+	writeWatchlist(ctx, &b, s)
 
 	if len(assigned) > 0 {
 		b.WriteString("\n### Assigned candidates (from the collector's work queue — investigate these FIRST)\n")
@@ -217,6 +218,34 @@ func writeOpenBook(ctx context.Context, b *strings.Builder, s *store.Store, p Pa
 		fmt.Fprintf(b, "- [%s] %s (item_id %d, %s): %s gp committed, opened %s\n",
 			st.Archetype, firstItemName(st.Items), st.PrimaryItemID, st.State, group(capital),
 			st.OpenedAt.Format("01-02"))
+	}
+}
+
+// writeWatchlist appends the ranked watch portfolio: ideas that earned their
+// place (operator conviction or a confirmed paper-trade) with a score that
+// decays unless revalidation keeps re-proving it. Best-effort like the other
+// intelligence sections.
+func writeWatchlist(ctx context.Context, b *strings.Builder, s *store.Store) {
+	watches, err := s.WatchRanked(ctx, 10)
+	if err != nil || len(watches) == 0 {
+		return
+	}
+	b.WriteString("\n### Watch portfolio (validated-good ideas, ranked by decayed score — strong hunting ground, but revalidate with live tools; scores decay unless re-confirmed)\n")
+	for _, w := range watches {
+		arch := "any"
+		if w.Archetype != nil {
+			arch = *w.Archetype
+		}
+		line := fmt.Sprintf("- %s (item_id %d, %s, score %.2f, %d/%d confirmed",
+			w.ItemName, w.ItemID, arch, w.EffScore, w.TimesConfirmed, w.TimesValidated)
+		if w.LastResult != nil {
+			line += ", last: " + *w.LastResult
+		}
+		line += ")"
+		if w.Note != nil && strings.TrimSpace(*w.Note) != "" {
+			line += " — " + strings.TrimSpace(*w.Note)
+		}
+		b.WriteString(line + "\n")
 	}
 }
 

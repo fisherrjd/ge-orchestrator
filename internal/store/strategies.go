@@ -124,10 +124,10 @@ func evalWindowHours(st SidecarStrategy) int {
 	}
 }
 
-// primaryItemID picks the item the scalar snapshot columns and kill_price key
+// PrimaryItemID picks the item the scalar snapshot columns and kill_price key
 // on. For C that's the first sell leg (the output you mark the conversion
 // to); everything else keys on items[0].
-func primaryItemID(st SidecarStrategy) int {
+func (st SidecarStrategy) PrimaryItemID() int {
 	if st.Archetype == "C" {
 		for _, l := range st.Legs {
 			if l.Side == "sell" {
@@ -138,61 +138,99 @@ func primaryItemID(st SidecarStrategy) int {
 	return st.Items[0].ID
 }
 
+// Vetoed pairs a sidecar strategy with the ship-time rule that rejected it.
+type Vetoed struct {
+	Strategy SidecarStrategy
+	Reason   string
+}
+
 // InsertStrategies ingests a run's sidecar strategies in one transaction.
 // V strategies enter ARMED — the evaluator opens them when their trigger
-// fires; everything else opens immediately.
-func (s *Store) InsertStrategies(ctx context.Context, runID int64, openedAt time.Time, list []SidecarStrategy) error {
+// fires; everything else opens immediately. Vetoed strategies are stored
+// closed with their rejection reason so nothing disappears silently.
+func (s *Store) InsertStrategies(ctx context.Context, runID int64, openedAt time.Time, list []SidecarStrategy, vetoed []Vetoed) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 	for _, st := range list {
-		if len(st.Items) == 0 {
-			return fmt.Errorf("strategy %s: no items", st.ID)
-		}
-		items, _ := json.Marshal(st.Items)
-		risks, _ := json.Marshal(st.Risks)
 		state := "open"
 		if st.Archetype == "V" {
 			state = "armed"
 		}
-		marshalOrNil := func(v any, present bool) any {
-			if !present {
-				return nil
-			}
-			b, _ := json.Marshal(v)
-			return b
+		if err := insertStrategy(ctx, tx, runID, openedAt, st, state, nil, nil); err != nil {
+			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO orchestrator.strategies
-			(run_id, sid, archetype, title, thesis, items, primary_item_id,
-			 entry_text, exit_text, entry_price, exit_price, kill_price, horizon_text,
-			 eval_window, capital_required, units_used,
-			 per_cycle_gp, per_1h_gp, per_day_gp, roi_pct,
-			 confidence, confidence_why, evidence, invalidation, risks, paper_trade,
-			 state, opened_at,
-			 buy_window, sell_window, trigger, direction, legs, relation_id, event)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
-			        make_interval(hours => $14),$15,$16,$17,$18,$19,$20,
-			        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)`,
-			runID, st.ID, st.Archetype, st.Title, st.Thesis, items, primaryItemID(st),
-			st.Entry, st.Exit, st.EntryPrice, st.ExitPrice, st.KillPrice, st.Horizon,
-			evalWindowHours(st), st.CapitalRequired, st.Size.UnitsUsed,
-			st.ExpectedValue.PerCycleGp, st.ExpectedValue.Per1hGp, st.ExpectedValue.PerDayGp, st.ExpectedValue.RoiPct,
-			st.Confidence, st.ConfidenceWhy, st.Evidence, st.Invalidation, risks, st.PaperTrade,
-			state, openedAt,
-			marshalOrNil(st.BuyWindow, st.BuyWindow != nil),
-			marshalOrNil(st.SellWindow, st.SellWindow != nil),
-			marshalOrNil(st.Trigger, st.Trigger != nil),
-			st.Direction,
-			marshalOrNil(st.Legs, len(st.Legs) > 0),
-			st.RelationID,
-			marshalOrNil(st.Event, st.Event != nil),
-		); err != nil {
-			return fmt.Errorf("insert strategy %s: %w", st.ID, err)
+	}
+	for _, v := range vetoed {
+		if err := insertStrategy(ctx, tx, runID, openedAt, v.Strategy, "vetoed", &v.Reason, &openedAt); err != nil {
+			return err
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+func insertStrategy(ctx context.Context, tx pgx.Tx, runID int64, openedAt time.Time, st SidecarStrategy, state string, reason *string, closedAt *time.Time) error {
+	if len(st.Items) == 0 {
+		return fmt.Errorf("strategy %s: no items", st.ID)
+	}
+	items, _ := json.Marshal(st.Items)
+	risks, _ := json.Marshal(st.Risks)
+	marshalOrNil := func(v any, present bool) any {
+		if !present {
+			return nil
+		}
+		b, _ := json.Marshal(v)
+		return b
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO orchestrator.strategies
+		(run_id, sid, archetype, title, thesis, items, primary_item_id,
+		 entry_text, exit_text, entry_price, exit_price, kill_price, horizon_text,
+		 eval_window, capital_required, units_used,
+		 per_cycle_gp, per_1h_gp, per_day_gp, roi_pct,
+		 confidence, confidence_why, evidence, invalidation, risks, paper_trade,
+		 state, state_reason, opened_at, closed_at,
+		 buy_window, sell_window, trigger, direction, legs, relation_id, event)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+		        make_interval(hours => $14),$15,$16,$17,$18,$19,$20,
+		        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)`,
+		runID, st.ID, st.Archetype, st.Title, st.Thesis, items, st.PrimaryItemID(),
+		st.Entry, st.Exit, st.EntryPrice, st.ExitPrice, st.KillPrice, st.Horizon,
+		evalWindowHours(st), st.CapitalRequired, st.Size.UnitsUsed,
+		st.ExpectedValue.PerCycleGp, st.ExpectedValue.Per1hGp, st.ExpectedValue.PerDayGp, st.ExpectedValue.RoiPct,
+		st.Confidence, st.ConfidenceWhy, st.Evidence, st.Invalidation, risks, st.PaperTrade,
+		state, reason, openedAt, closedAt,
+		marshalOrNil(st.BuyWindow, st.BuyWindow != nil),
+		marshalOrNil(st.SellWindow, st.SellWindow != nil),
+		marshalOrNil(st.Trigger, st.Trigger != nil),
+		st.Direction,
+		marshalOrNil(st.Legs, len(st.Legs) > 0),
+		st.RelationID,
+		marshalOrNil(st.Event, st.Event != nil),
+	); err != nil {
+		return fmt.Errorf("insert strategy %s: %w", st.ID, err)
+	}
+	return nil
+}
+
+// CommittedCapital sums capital_required across the live book (open + armed) —
+// the number ship-time capital vetting charges new strategies against.
+func (s *Store) CommittedCapital(ctx context.Context) (int64, error) {
+	var total int64
+	err := s.Pool.QueryRow(ctx, `SELECT coalesce(sum(capital_required), 0)
+		FROM orchestrator.strategies WHERE state IN ('open','armed')`).Scan(&total)
+	return total, err
+}
+
+// HasOpenStrategyForItem reports whether the live book already trades this
+// item under this archetype (the ship-time dedup rule).
+func (s *Store) HasOpenStrategyForItem(ctx context.Context, itemID int, archetype string) (bool, error) {
+	var exists bool
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM orchestrator.strategies
+		WHERE state IN ('open','armed') AND primary_item_id=$1 AND archetype=$2)`,
+		itemID, archetype).Scan(&exists)
+	return exists, err
 }
 
 type Strategy struct {

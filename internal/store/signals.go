@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Signal is one row of the collector's work queue: something the sweeps
@@ -62,16 +64,30 @@ func (s *Store) AssignSignals(ctx context.Context, runID int64, ids []int64) err
 }
 
 // ResolveSignal applies a run's verdict: shipped -> investigated,
-// dismissed -> dismissed, both with the model's reason.
+// dismissed -> dismissed, both with the model's reason. A dismissed 'watch'
+// signal is a failed revalidation, so it decays the item's portfolio entry
+// (shipped watches score later, through the strategy's own outcome).
 func (s *Store) ResolveSignal(ctx context.Context, signalID int64, verdict, reason string) error {
 	status := "dismissed"
 	if verdict == "shipped" {
 		status = "investigated"
 	}
-	_, err := s.Pool.Exec(ctx, `UPDATE orchestrator.signals
+	var kind string
+	var itemID int
+	err := s.Pool.QueryRow(ctx, `UPDATE orchestrator.signals
 		SET status=$2, reason=$3, resolved_at=now()
-		WHERE signal_id=$1 AND status IN ('pending','assigned')`, signalID, status, reason)
-	return err
+		WHERE signal_id=$1 AND status IN ('pending','assigned')
+		RETURNING kind, item_id`, signalID, status, reason).Scan(&kind, &itemID)
+	if err == pgx.ErrNoRows {
+		return nil // already resolved (or unknown id) — same as the old no-op
+	}
+	if err != nil {
+		return err
+	}
+	if kind == "watch" && status == "dismissed" {
+		return s.RecordWatchDismissal(ctx, itemID)
+	}
+	return nil
 }
 
 // ReleaseRunSignals returns a failed run's assigned signals to the queue so

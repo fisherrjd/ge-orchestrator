@@ -35,10 +35,10 @@ var archetypeNames = map[string]string{
 
 func Defaults() Params {
 	return Params{
-		CapitalGp: 100_000_000, Risk: "medium", MinConfidence: "medium",
-		// S is the flagship: the directive requires every run to evaluate
-		// seasonal candidates, and the weight says to favor them.
-		Archetypes: map[string]float64{"S": 1.5, "V": 1, "C": 1, "U": 1, "H": 1},
+		// The operator runs low-touch on a 10-30M bankroll and wants reliable
+		// gp/day: repeatable mechanical edges (S/C/H) over variance plays (V/U).
+		CapitalGp: 25_000_000, Risk: "low", MinConfidence: "medium",
+		Archetypes: map[string]float64{"S": 1.5, "V": 0.5, "C": 1.2, "U": 0.5, "H": 1},
 	}
 }
 
@@ -95,6 +95,11 @@ func Render(ctx context.Context, s *store.Store, p Params, at time.Time, assigne
 		b.WriteString("\n")
 	}
 	b.WriteString("- Archetype S is the baseline: ship at least one S strategy or document in Discarded why every seasonal candidate failed falsification.\n")
+	b.WriteString("- Execution is LOW-TOUCH: the operator places offers at most twice a day. Every strategy must work with offers placed in advance and checked on that cadence — nothing that needs a fast reaction.\n")
+	b.WriteString("- Objective: reliable gp/day. Prefer the boring, repeatable, high-confidence edge over the bigger speculative one; ship fewer, stronger strategies.\n")
+
+	writeOpenBook(ctx, &b, s, p)
+	writeWatchlist(ctx, &b, s)
 
 	if len(assigned) > 0 {
 		b.WriteString("\n### Assigned candidates (from the collector's work queue — investigate these FIRST)\n")
@@ -128,6 +133,9 @@ func Render(ctx context.Context, s *store.Store, p Params, at time.Time, assigne
 		for _, r := range liveRows {
 			closed := r.N - r.Open - r.Armed
 			line := fmt.Sprintf("- %s: n=%d (%d open, %d armed)", r.Archetype, r.N, r.Open, r.Armed)
+			if r.Vetoed > 0 {
+				line += fmt.Sprintf(", %d vetoed at ship time — check kill_price and capital against a live quote before shipping", r.Vetoed)
+			}
 			if closed > 0 {
 				surv := float64(r.Confirmed) / float64(closed) * 100
 				line += fmt.Sprintf(", %.0f%% of closed confirmed", surv)
@@ -166,6 +174,90 @@ func Render(ctx context.Context, s *store.Store, p Params, at time.Time, assigne
 		b.WriteString("\n### Operator notes\n" + strings.TrimSpace(p.Notes) + "\n")
 	}
 	return b.String(), nil
+}
+
+// writeOpenBook appends the live book (open + armed strategies) with its
+// committed capital, so the model dedups against it and sizes into the
+// remaining bankroll instead of re-committing the same gp every run. The
+// ship-time vetter enforces both rules mechanically; telling the model here
+// saves it from wasting a strategy slot on a doomed pitch. Best-effort: a
+// query failure just omits the section (the vetter still has the last word).
+func writeOpenBook(ctx context.Context, b *strings.Builder, s *store.Store, p Params) {
+	open, err := s.EvaluableStrategies(ctx)
+	if err != nil {
+		return
+	}
+	var committed int64
+	for _, st := range open {
+		if st.Capital != nil {
+			committed += *st.Capital
+		}
+	}
+	remaining := p.CapitalGp - committed
+	if remaining < 0 {
+		remaining = 0
+	}
+	b.WriteString("\n### Open book (already paper-trading — dedup and capital rules are enforced at ingest)\n")
+	fmt.Fprintf(b, "- Committed capital: %s gp of %s gp; remaining for new strategies: %s gp. A strategy that does not fit the remainder is vetoed.\n",
+		group(committed), group(p.CapitalGp), group(remaining))
+	if len(open) == 0 {
+		b.WriteString("- The book is empty — the full bankroll is available.\n")
+		return
+	}
+	b.WriteString("- Do NOT pitch an item that already has an open/armed strategy of the same archetype — it is vetoed at ingest.\n")
+	const maxLines = 20
+	for i, st := range open {
+		if i == maxLines {
+			fmt.Fprintf(b, "- …and %d more open strategies.\n", len(open)-maxLines)
+			break
+		}
+		capital := int64(0)
+		if st.Capital != nil {
+			capital = *st.Capital
+		}
+		fmt.Fprintf(b, "- [%s] %s (item_id %d, %s): %s gp committed, opened %s\n",
+			st.Archetype, firstItemName(st.Items), st.PrimaryItemID, st.State, group(capital),
+			st.OpenedAt.Format("01-02"))
+	}
+}
+
+// writeWatchlist appends the ranked watch portfolio: ideas that earned their
+// place (operator conviction or a confirmed paper-trade) with a score that
+// decays unless revalidation keeps re-proving it. Best-effort like the other
+// intelligence sections.
+func writeWatchlist(ctx context.Context, b *strings.Builder, s *store.Store) {
+	watches, err := s.WatchRanked(ctx, 10)
+	if err != nil || len(watches) == 0 {
+		return
+	}
+	b.WriteString("\n### Watch portfolio (validated-good ideas, ranked by decayed score — strong hunting ground, but revalidate with live tools; scores decay unless re-confirmed)\n")
+	for _, w := range watches {
+		arch := "any"
+		if w.Archetype != nil {
+			arch = *w.Archetype
+		}
+		line := fmt.Sprintf("- %s (item_id %d, %s, score %.2f, %d/%d confirmed",
+			w.ItemName, w.ItemID, arch, w.EffScore, w.TimesConfirmed, w.TimesValidated)
+		if w.LastResult != nil {
+			line += ", last: " + *w.LastResult
+		}
+		line += ")"
+		if w.Note != nil && strings.TrimSpace(*w.Note) != "" {
+			line += " — " + strings.TrimSpace(*w.Note)
+		}
+		b.WriteString(line + "\n")
+	}
+}
+
+// firstItemName digs the display name out of the stored items JSON.
+func firstItemName(raw json.RawMessage) string {
+	var items []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &items); err != nil || len(items) == 0 || items[0].Name == "" {
+		return "unknown item"
+	}
+	return items[0].Name
 }
 
 // writeSweep appends a compact view of the collector's latest sweep so the

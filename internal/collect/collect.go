@@ -27,6 +27,7 @@ type Config struct {
 	BandWidthMin   float64 // band width pct floor for band signals (default 15)
 	SnapshotTopN   int     // rows persisted per lens per cycle (default 25)
 	SignalTTL      time.Duration // pending signals expire after this (default 72h)
+	RevalidateAfter time.Duration // watch entries re-queue after this (default 5d)
 }
 
 func (c *Config) defaults() {
@@ -48,6 +49,9 @@ func (c *Config) defaults() {
 	if c.SignalTTL == 0 {
 		c.SignalTTL = 72 * time.Hour
 	}
+	if c.RevalidateAfter == 0 {
+		c.RevalidateAfter = 5 * 24 * time.Hour
+	}
 }
 
 type Collector struct {
@@ -64,6 +68,7 @@ func (c *Collector) Cycle(ctx context.Context) int {
 	newSignals += c.sweepVolume(ctx, asOf)
 	newSignals += c.sweepSeasonal(ctx, asOf)
 	newSignals += c.sweepBand(ctx, asOf)
+	newSignals += c.sweepWatch(ctx)
 	if n, err := c.Store.ExpireStaleSignals(ctx, c.Cfg.SignalTTL); err != nil {
 		log.Printf("collect: expire stale: %v", err)
 	} else if n > 0 {
@@ -305,6 +310,47 @@ func (c *Collector) sweepBand(ctx context.Context, asOf time.Time) int {
 	return persist(c, ctx, asOf, "band", parsed, func(r bandRow) (int, string, bool) {
 		return r.ItemID, r.Name, r.RangePos <= c.Cfg.BandPosMax && r.WidthPct >= c.Cfg.BandWidthMin
 	})
+}
+
+// --- watch lens: revalidation of the ranked portfolio ---
+
+// sweepWatch queues a 'watch' signal for portfolio entries that haven't been
+// validated recently, so research runs re-prove them (ship a fresh strategy)
+// or decay them (dismiss). This is the loop that keeps the "good" stack
+// honest: without it an entry's score would just coast on its history.
+func (c *Collector) sweepWatch(ctx context.Context) int {
+	due, err := c.Store.WatchDueForRevalidation(ctx, c.Cfg.RevalidateAfter, 10)
+	if err != nil {
+		log.Printf("collect: watch due: %v", err)
+		return 0
+	}
+	newSignals := 0
+	for _, w := range due {
+		metrics := map[string]any{
+			"watch_id": w.WatchID, "score": w.Score, "eff_score": w.EffScore,
+			"source": w.Source, "times_confirmed": w.TimesConfirmed,
+			"times_validated": w.TimesValidated,
+		}
+		if w.Archetype != nil {
+			metrics["archetype"] = *w.Archetype
+		}
+		if w.Note != nil {
+			metrics["note"] = *w.Note
+		}
+		if w.LastResult != nil {
+			metrics["last_result"] = *w.LastResult
+		}
+		isNew, err := c.Store.UpsertSignal(ctx, "watch", w.ItemID, w.ItemName, metrics)
+		if err != nil {
+			log.Printf("collect: watch signal %d: %v", w.ItemID, err)
+			continue
+		}
+		if isNew {
+			newSignals++
+			log.Printf("collect: revalidation due: %s (eff score %.2f)", w.ItemName, w.EffScore)
+		}
+	}
+	return newSignals
 }
 
 // persist stores the sweep's rows as trend snapshots and queues signals for

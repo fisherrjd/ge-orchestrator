@@ -196,7 +196,7 @@ func (ev *Evaluator) transition(ctx context.Context, st store.Strategy, now time
 			if fails := failing(checks); len(fails) > 0 {
 				reason += " (failing: " + join(fails) + ")"
 			}
-			return ev.Store.CloseStrategy(ctx, st.StrategyID, "killed", reason)
+			return ev.closeAndScore(ctx, st, "killed", reason)
 		}
 		return nil
 	}
@@ -214,21 +214,47 @@ func (ev *Evaluator) transition(ctx context.Context, st store.Strategy, now time
 		// S additionally needs at least one observed cycle in each window —
 		// a week where the market never printed in your windows proves nothing.
 		if st.Archetype == "S" && !checks["windows_observed"] {
-			return ev.Store.CloseStrategy(ctx, st.StrategyID, "expired",
+			return ev.closeAndScore(ctx, st, "expired",
 				"eval window elapsed without enough in-window observations to judge")
 		}
 		if total > 0 && float64(healthy)/float64(total) >= pol.ConfirmHealthy &&
 			ratio != nil && *ratio >= pol.ConfirmRatioMin {
 			reason := sprintf("window %s: %d/%d healthy, median realized/projected %.2f (haircut)", window, healthy, total, *ratio)
-			return ev.Store.CloseStrategy(ctx, st.StrategyID, "confirmed", reason)
+			return ev.closeAndScore(ctx, st, "confirmed", reason)
 		}
 		r := sprintf("window %s elapsed without meeting confirmation", window)
 		if ratio != nil {
 			r += sprintf(" (%d/%d healthy, ratio %.2f)", healthy, total, *ratio)
 		}
-		return ev.Store.CloseStrategy(ctx, st.StrategyID, "expired", r)
+		return ev.closeAndScore(ctx, st, "expired", r)
 	}
 	return nil
+}
+
+// closeAndScore closes the strategy and feeds the outcome into the watch
+// portfolio (confirmations promote the item; kills and expiries decay it).
+// Scoring failure is logged, not returned — the close already happened and
+// must not be retried as if it hadn't.
+func (ev *Evaluator) closeAndScore(ctx context.Context, st store.Strategy, state, reason string) error {
+	if err := ev.Store.CloseStrategy(ctx, st.StrategyID, state, reason); err != nil {
+		return err
+	}
+	name := firstItemName(st.Items)
+	if err := ev.Store.RecordStrategyOutcome(ctx, st.PrimaryItemID, name, st.Archetype, st.Sid, state); err != nil {
+		log.Printf("eval: watchlist outcome for %s (%s): %v", st.Sid, state, err)
+	}
+	return nil
+}
+
+// firstItemName digs the display name out of the stored items JSON.
+func firstItemName(raw json.RawMessage) string {
+	var items []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &items); err != nil || len(items) == 0 || items[0].Name == "" {
+		return "unknown item"
+	}
+	return items[0].Name
 }
 
 // --- shared helpers ---

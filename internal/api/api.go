@@ -459,9 +459,9 @@ func (s *Server) listSignals(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listTrends(w http.ResponseWriter, r *http.Request) {
 	lens := r.URL.Query().Get("lens")
 	switch lens {
-	case "seasonal", "volume", "band":
+	case "seasonal", "volume", "band", "flip":
 	default:
-		writeErr(w, 400, "lens must be seasonal, volume or band")
+		writeErr(w, 400, "lens must be seasonal, volume, band or flip")
 		return
 	}
 	list, err := s.Store.LatestTrends(r.Context(), lens, 25)

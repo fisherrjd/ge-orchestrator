@@ -39,6 +39,14 @@ func Defaults() Params {
 		// gp/day: repeatable mechanical edges (S/C/H) over variance plays (V/U).
 		CapitalGp: 25_000_000, Risk: "low", MinConfidence: "medium",
 		Archetypes: map[string]float64{"S": 1.5, "V": 0.5, "C": 1.2, "U": 0.5, "H": 1},
+		// The operator's own screen, in their words: it feeds the 'flip'
+		// sweep lens and the signals it queues. The margin is the symptom to
+		// explain — a persistent fresh two-sided margin usually hides an S/V/H
+		// mechanism; the no-passive-spread-flips rule still applies.
+		Notes: "Items where instabuy AND instasell both printed within 30 min, 24h volume ≥ 200 units, " +
+			"ranked by post-tax margin, are good hunting ground (the 'flip' sweep + signals run this screen " +
+			"mechanically). Investigate WHY such a margin persists — population cycle, conversion link, " +
+			"repricing in progress — and ship that mechanism as the strategy. A margin alone is still not a thesis.",
 	}
 }
 
@@ -268,6 +276,7 @@ func writeSweep(ctx context.Context, b *strings.Builder, s *store.Store) {
 		{"seasonal", "hour-of-week amplitude"},
 		{"volume", "volume anomalies"},
 		{"band", "below 21d band"},
+		{"flip", "fresh two-sided post-tax margin (operator screen — explain the margin, don't just flip it)"},
 	}
 	wrote := false
 	for _, l := range lenses {

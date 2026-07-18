@@ -28,6 +28,13 @@ type Config struct {
 	SnapshotTopN   int     // rows persisted per lens per cycle (default 25)
 	SignalTTL      time.Duration // pending signals expire after this (default 72h)
 	RevalidateAfter time.Duration // watch entries re-queue after this (default 5d)
+
+	// Flip lens — the operator's screen: both legs fresh, real daily
+	// volume, ranked by post-tax margin, at prices the bankroll can trade.
+	FlipFreshAge     time.Duration // both legs traded within this (default 30m)
+	FlipVolMin24h    int64         // 24h volume floor in units (default 200)
+	FlipMarginPctMin float64       // margin/low % to queue a signal (default 2)
+	FlipPriceMax     int64         // skip items the bankroll can't buy (default 25M)
 }
 
 func (c *Config) defaults() {
@@ -52,6 +59,18 @@ func (c *Config) defaults() {
 	if c.RevalidateAfter == 0 {
 		c.RevalidateAfter = 5 * 24 * time.Hour
 	}
+	if c.FlipFreshAge == 0 {
+		c.FlipFreshAge = 30 * time.Minute
+	}
+	if c.FlipVolMin24h == 0 {
+		c.FlipVolMin24h = 200
+	}
+	if c.FlipMarginPctMin == 0 {
+		c.FlipMarginPctMin = 2
+	}
+	if c.FlipPriceMax == 0 {
+		c.FlipPriceMax = 25_000_000
+	}
 }
 
 type Collector struct {
@@ -68,6 +87,7 @@ func (c *Collector) Cycle(ctx context.Context) int {
 	newSignals += c.sweepVolume(ctx, asOf)
 	newSignals += c.sweepSeasonal(ctx, asOf)
 	newSignals += c.sweepBand(ctx, asOf)
+	newSignals += c.sweepFlip(ctx, asOf)
 	newSignals += c.sweepWatch(ctx)
 	if n, err := c.Store.ExpireStaleSignals(ctx, c.Cfg.SignalTTL); err != nil {
 		log.Printf("collect: expire stale: %v", err)
@@ -309,6 +329,70 @@ func (c *Collector) sweepBand(ctx context.Context, asOf time.Time) int {
 	}
 	return persist(c, ctx, asOf, "band", parsed, func(r bandRow) (int, string, bool) {
 		return r.ItemID, r.Name, r.RangePos <= c.Cfg.BandPosMax && r.WidthPct >= c.Cfg.BandWidthMin
+	})
+}
+
+// --- flip lens: the operator's screen ---
+// Both legs traded within FlipFreshAge (a margin between a stale high and a
+// fresh low was never simultaneously real), 24h volume >= FlipVolMin24h,
+// price within FlipPriceMax, ranked by post-tax margin (prices_1m.margin —
+// already tax-adjusted, never recomputed).
+
+const flipSweepSQL = `
+WITH latest AS (
+  SELECT DISTINCT ON (item_id) item_id, high, low, margin, high_time, low_time
+  FROM prices_1m WHERE ts >= now() - interval '2 hours'
+  ORDER BY item_id, ts DESC
+),
+vol AS (
+  SELECT item_id, sum(coalesce(high_volume,0)+coalesce(low_volume,0)) AS vol24h
+  FROM prices_5m WHERE ts >= now() - interval '24 hours' GROUP BY 1
+)
+SELECT l.item_id, i.name, l.high, l.low, l.margin,
+       round((100.0*l.margin/nullif(l.low,0))::numeric, 2)::float8 AS margin_pct,
+       extract(epoch from (now()-l.high_time))::int AS high_age_s,
+       extract(epoch from (now()-l.low_time))::int  AS low_age_s,
+       v.vol24h
+FROM latest l JOIN vol v USING (item_id) JOIN items i USING (item_id)
+WHERE l.margin IS NOT NULL AND l.margin > 0
+  AND l.high_time >= now() - $1::interval
+  AND l.low_time  >= now() - $1::interval
+  AND v.vol24h >= $2
+  AND l.high <= $3
+ORDER BY l.margin DESC
+LIMIT $4`
+
+func (c *Collector) sweepFlip(ctx context.Context, asOf time.Time) int {
+	rows, err := c.Store.Pool.Query(ctx, flipSweepSQL,
+		c.Cfg.FlipFreshAge.String(), c.Cfg.FlipVolMin24h, c.Cfg.FlipPriceMax, c.Cfg.SnapshotTopN)
+	if err != nil {
+		log.Printf("collect: flip sweep: %v", err)
+		return 0
+	}
+	defer rows.Close()
+	type flipRow struct {
+		ItemID    int     `json:"item_id"`
+		Name      string  `json:"name"`
+		High      int64   `json:"high"`
+		Low       int64   `json:"low"`
+		Margin    int64   `json:"margin"`
+		MarginPct float64 `json:"margin_pct"`
+		HighAgeS  int     `json:"high_age_s"`
+		LowAgeS   int     `json:"low_age_s"`
+		Vol24h    int64   `json:"vol24h"`
+	}
+	var parsed []flipRow
+	for rows.Next() {
+		var r flipRow
+		if err := rows.Scan(&r.ItemID, &r.Name, &r.High, &r.Low, &r.Margin,
+			&r.MarginPct, &r.HighAgeS, &r.LowAgeS, &r.Vol24h); err != nil {
+			log.Printf("collect: flip scan: %v", err)
+			return 0
+		}
+		parsed = append(parsed, r)
+	}
+	return persist(c, ctx, asOf, "flip", parsed, func(r flipRow) (int, string, bool) {
+		return r.ItemID, r.Name, r.MarginPct >= c.Cfg.FlipMarginPctMin
 	})
 }
 

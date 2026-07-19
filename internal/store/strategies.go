@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -69,6 +70,7 @@ type SidecarStrategy struct {
 	ExitPrice       int64  `json:"exit_price"`
 	KillPrice       *int64 `json:"kill_price"`
 	Horizon         string `json:"horizon"`
+	Attention       string `json:"attention,omitempty"` // F/B execution contract
 	CapitalRequired int64  `json:"capital_required"`
 	Size            struct {
 		BuyLimit       int64 `json:"buy_limit"`
@@ -107,7 +109,7 @@ type Sidecar struct {
 
 // evalWindowHours resolves the paper-trading window: the model's explicit
 // choice, else the per-kind default (S one weekly cycle; V from trigger fire;
-// U around the event; C/legacy 48h).
+// B a few flip turnarounds; U around the event; F/C/legacy 48h).
 func evalWindowHours(st SidecarStrategy) int {
 	if st.EvalWindowHours != nil {
 		return *st.EvalWindowHours
@@ -115,7 +117,7 @@ func evalWindowHours(st SidecarStrategy) int {
 	switch st.Archetype {
 	case "S":
 		return 168
-	case "V":
+	case "V", "B":
 		return 96
 	case "U":
 		return 72
@@ -184,19 +186,25 @@ func insertStrategy(ctx context.Context, tx pgx.Tx, runID int64, openedAt time.T
 		b, _ := json.Marshal(v)
 		return b
 	}
+	nullIfEmpty := func(s string) any {
+		if strings.TrimSpace(s) == "" {
+			return nil
+		}
+		return s
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO orchestrator.strategies
 		(run_id, sid, archetype, title, thesis, items, primary_item_id,
-		 entry_text, exit_text, entry_price, exit_price, kill_price, horizon_text,
+		 entry_text, exit_text, entry_price, exit_price, kill_price, horizon_text, attention,
 		 eval_window, capital_required, units_used,
 		 per_cycle_gp, per_1h_gp, per_day_gp, roi_pct,
 		 confidence, confidence_why, evidence, invalidation, risks, paper_trade,
 		 state, state_reason, opened_at, closed_at,
 		 buy_window, sell_window, trigger, direction, legs, relation_id, event)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
-		        make_interval(hours => $14),$15,$16,$17,$18,$19,$20,
-		        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+		        make_interval(hours => $15),$16,$17,$18,$19,$20,$21,
+		        $22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38)`,
 		runID, st.ID, st.Archetype, st.Title, st.Thesis, items, st.PrimaryItemID(),
-		st.Entry, st.Exit, st.EntryPrice, st.ExitPrice, st.KillPrice, st.Horizon,
+		st.Entry, st.Exit, st.EntryPrice, st.ExitPrice, st.KillPrice, st.Horizon, nullIfEmpty(st.Attention),
 		evalWindowHours(st), st.CapitalRequired, st.Size.UnitsUsed,
 		st.ExpectedValue.PerCycleGp, st.ExpectedValue.Per1hGp, st.ExpectedValue.PerDayGp, st.ExpectedValue.RoiPct,
 		st.Confidence, st.ConfidenceWhy, st.Evidence, st.Invalidation, risks, st.PaperTrade,
@@ -248,6 +256,7 @@ type Strategy struct {
 	ExitPrice     int64           `json:"exit_price"`
 	KillPrice     *int64          `json:"kill_price"`
 	HorizonText   string          `json:"horizon"`
+	Attention     *string         `json:"attention,omitempty"`
 	Capital       *int64          `json:"capital_required"`
 	UnitsUsed     *int64          `json:"units_used"`
 	PerCycleGp    *int64          `json:"per_cycle_gp"`
@@ -277,7 +286,7 @@ type Strategy struct {
 }
 
 const strategyCols = `strategy_id, run_id, sid, archetype, title, thesis, items, primary_item_id,
-	entry_text, exit_text, entry_price, exit_price, kill_price, horizon_text,
+	entry_text, exit_text, entry_price, exit_price, kill_price, horizon_text, attention,
 	capital_required, units_used, per_cycle_gp, per_1h_gp, per_day_gp, roi_pct,
 	confidence, confidence_why, invalidation, risks, paper_trade,
 	state, state_reason, opened_at, closed_at,
@@ -289,7 +298,7 @@ func scanStrategy(row pgx.Row) (*Strategy, error) {
 	var buyW, sellW, trig, legs, event []byte
 	err := row.Scan(&st.StrategyID, &st.RunID, &st.Sid, &st.Archetype, &st.Title, &st.Thesis,
 		&st.Items, &st.PrimaryItemID, &st.EntryText, &st.ExitText, &st.EntryPrice, &st.ExitPrice,
-		&st.KillPrice, &st.HorizonText, &st.Capital, &st.UnitsUsed,
+		&st.KillPrice, &st.HorizonText, &st.Attention, &st.Capital, &st.UnitsUsed,
 		&st.PerCycleGp, &st.Per1hGp, &st.PerDayGp, &st.RoiPct,
 		&st.Confidence, &st.ConfidenceWhy, &st.Invalidation, &st.Risks, &st.PaperTrade,
 		&st.State, &st.StateReason, &st.OpenedAt, &st.ClosedAt,

@@ -59,6 +59,13 @@ func policyFor(archetype string) Policy {
 	switch archetype {
 	case "H":
 		return Policy{KillConsecutive: 6, ConfirmHealthy: confirmHealthyPct, ConfirmRatioMin: holdConfirmRatio, MinTickGap: time.Hour}
+	case "F":
+		// Intraday cycles: evaluate every ~15m; three consecutive floor
+		// breaches (~45m of collapsed spread) kills.
+		return Policy{KillConsecutive: 3, ConfirmHealthy: confirmHealthyPct, ConfirmRatioMin: confirmRatioMin, MinTickGap: 15 * time.Minute}
+	case "B":
+		// Day-scale holds: hourly cadence, slower kill like H.
+		return Policy{KillConsecutive: 6, ConfirmHealthy: confirmHealthyPct, ConfirmRatioMin: confirmRatioMin, MinTickGap: time.Hour}
 	default:
 		return Policy{KillConsecutive: 3, ConfirmHealthy: confirmHealthyPct, ConfirmRatioMin: confirmRatioMin}
 	}
@@ -137,6 +144,8 @@ func (ev *Evaluator) evaluate(ctx context.Context, st store.Strategy) error {
 // shared by the ticker (which stores the result) and the API's live=1 view.
 func (ev *Evaluator) Compute(ctx context.Context, st store.Strategy) (store.Evaluation, map[string]bool, error) {
 	switch st.Archetype {
+	case "F", "B":
+		return ev.computeFlip(ctx, st)
 	case "S":
 		return ev.computeSeasonal(ctx, st)
 	case "V":

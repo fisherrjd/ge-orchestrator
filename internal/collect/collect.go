@@ -21,34 +21,31 @@ import (
 
 type Config struct {
 	// Signal thresholds — start conservative, tune from the queue's hit rate.
-	VolZMin        float64 // |z| to queue a volume signal (default 8)
-	SeasonalAmpMin float64 // amplitude_pct to queue a seasonal signal (default 5)
-	BandPosMax     float64 // range position to queue a band signal (default 0.05)
-	BandWidthMin   float64 // band width pct floor for band signals (default 15)
-	SnapshotTopN   int     // rows persisted per lens per cycle (default 25)
-	SignalTTL      time.Duration // pending signals expire after this (default 72h)
+	VolZMin         float64       // |z| to queue a volume signal (default 8)
+	SnapshotTopN    int           // rows persisted per lens per cycle (default 25)
+	SignalTTL       time.Duration // pending signals expire after this (default 72h)
 	RevalidateAfter time.Duration // watch entries re-queue after this (default 5d)
 
-	// Flip lens — the operator's screen: both legs fresh, real daily
-	// volume, ranked by post-tax margin, at prices the bankroll can trade.
-	FlipFreshAge     time.Duration // both legs traded within this (default 30m)
-	FlipVolMin24h    int64         // 24h volume floor in units (default 200)
-	FlipMarginPctMin float64       // margin/low % to queue a signal (default 2)
-	FlipPriceMax     int64         // skip items the bankroll can't buy (default 25M)
+	// Lane F — volume flips: deep-market commodities where post-tax margin x
+	// buy limit pays real gp per 4h cycle. Ranked and gated in absolute gp.
+	FlipFreshAge   time.Duration // both legs traded within this (default 30m)
+	FlipVolMin24h  int64         // 24h volume floor in units (default 100k)
+	FlipGpCycleMin int64         // margin x buy_limit floor to queue a signal (default 200k)
+
+	// Lane B — high-value flips: 10M+ items with a fresh two-sided market,
+	// ranked by absolute post-tax margin, sized by what the budget affords.
+	HighValueMinPrice   int64 // buy-leg price floor (default 10M)
+	HighValueVolMin24h  int64 // 24h volume floor in units (default 200)
+	HighValueGpCycleMin int64 // margin x affordable units floor to queue (default 100k)
+
+	// ResearchBudgetGp caps lane B's affordable units (default 50M). A
+	// per-opportunity sizing scale, not a shared pool.
+	ResearchBudgetGp int64
 }
 
 func (c *Config) defaults() {
 	if c.VolZMin == 0 {
 		c.VolZMin = 8
-	}
-	if c.SeasonalAmpMin == 0 {
-		c.SeasonalAmpMin = 5
-	}
-	if c.BandPosMax == 0 {
-		c.BandPosMax = 0.05
-	}
-	if c.BandWidthMin == 0 {
-		c.BandWidthMin = 15
 	}
 	if c.SnapshotTopN == 0 {
 		c.SnapshotTopN = 25
@@ -63,13 +60,22 @@ func (c *Config) defaults() {
 		c.FlipFreshAge = 30 * time.Minute
 	}
 	if c.FlipVolMin24h == 0 {
-		c.FlipVolMin24h = 200
+		c.FlipVolMin24h = 100_000
 	}
-	if c.FlipMarginPctMin == 0 {
-		c.FlipMarginPctMin = 2
+	if c.FlipGpCycleMin == 0 {
+		c.FlipGpCycleMin = 200_000
 	}
-	if c.FlipPriceMax == 0 {
-		c.FlipPriceMax = 25_000_000
+	if c.HighValueMinPrice == 0 {
+		c.HighValueMinPrice = 10_000_000
+	}
+	if c.HighValueVolMin24h == 0 {
+		c.HighValueVolMin24h = 200
+	}
+	if c.HighValueGpCycleMin == 0 {
+		c.HighValueGpCycleMin = 100_000
+	}
+	if c.ResearchBudgetGp == 0 {
+		c.ResearchBudgetGp = 50_000_000
 	}
 }
 
@@ -85,9 +91,10 @@ func (c *Collector) Cycle(ctx context.Context) int {
 	asOf := time.Now().UTC()
 	newSignals := 0
 	newSignals += c.sweepVolume(ctx, asOf)
-	newSignals += c.sweepSeasonal(ctx, asOf)
-	newSignals += c.sweepBand(ctx, asOf)
+	newSignals += c.sweepSeasonal(ctx, asOf) // snapshots only — timing evidence, no signals
+	newSignals += c.sweepBand(ctx, asOf)     // snapshots only — qualification evidence, no signals
 	newSignals += c.sweepFlip(ctx, asOf)
+	newSignals += c.sweepHighValue(ctx, asOf)
 	newSignals += c.sweepWatch(ctx)
 	if n, err := c.Store.ExpireStaleSignals(ctx, c.Cfg.SignalTTL); err != nil {
 		log.Printf("collect: expire stale: %v", err)
@@ -266,8 +273,10 @@ func (c *Collector) sweepSeasonal(ctx context.Context, asOf time.Time) int {
 		log.Printf("collect: seasonal commit: %v", err)
 		return 0
 	}
+	// Flips-first redesign: seasonal structure is timing evidence for the
+	// flip lanes, not a strategy source — persist snapshots, queue nothing.
 	return persist(c, ctx, asOf, "seasonal", parsed, func(r seaRow) (int, string, bool) {
-		return r.ItemID, r.Name, r.AmplitudePct >= c.Cfg.SeasonalAmpMin
+		return r.ItemID, r.Name, false
 	})
 }
 
@@ -327,16 +336,19 @@ func (c *Collector) sweepBand(ctx context.Context, asOf time.Time) int {
 		}
 		parsed = append(parsed, r)
 	}
+	// Flips-first redesign: band position is lane-B qualification evidence,
+	// not a strategy source — persist snapshots, queue nothing.
 	return persist(c, ctx, asOf, "band", parsed, func(r bandRow) (int, string, bool) {
-		return r.ItemID, r.Name, r.RangePos <= c.Cfg.BandPosMax && r.WidthPct >= c.Cfg.BandWidthMin
+		return r.ItemID, r.Name, false
 	})
 }
 
-// --- flip lens: the operator's screen ---
+// --- lane F: volume flips ---
 // Both legs traded within FlipFreshAge (a margin between a stale high and a
-// fresh low was never simultaneously real), 24h volume >= FlipVolMin24h,
-// price within FlipPriceMax, ranked by post-tax margin (prices_1m.margin —
-// already tax-adjusted, never recomputed).
+// fresh low was never simultaneously real), 24h volume >= FlipVolMin24h
+// (deep commodity markets only), ranked by gp_cycle = post-tax margin x
+// buy_limit (prices_1m.margin — already tax-adjusted, never recomputed).
+// The signal gate is the same number: absolute gp per 4h cycle, no ratios.
 
 const flipSweepSQL = `
 WITH latest AS (
@@ -349,50 +361,121 @@ vol AS (
   FROM prices_5m WHERE ts >= now() - interval '24 hours' GROUP BY 1
 )
 SELECT l.item_id, i.name, l.high, l.low, l.margin,
-       round((100.0*l.margin/nullif(l.low,0))::numeric, 2)::float8 AS margin_pct,
+       i.buy_limit,
+       l.margin * i.buy_limit AS gp_cycle,
        extract(epoch from (now()-l.high_time))::int AS high_age_s,
        extract(epoch from (now()-l.low_time))::int  AS low_age_s,
        v.vol24h
 FROM latest l JOIN vol v USING (item_id) JOIN items i USING (item_id)
 WHERE l.margin IS NOT NULL AND l.margin > 0
+  AND i.buy_limit > 0
   AND l.high_time >= now() - $1::interval
   AND l.low_time  >= now() - $1::interval
   AND v.vol24h >= $2
-  AND l.high <= $3
-ORDER BY l.margin DESC
-LIMIT $4`
+ORDER BY l.margin * i.buy_limit DESC
+LIMIT $3`
 
 func (c *Collector) sweepFlip(ctx context.Context, asOf time.Time) int {
 	rows, err := c.Store.Pool.Query(ctx, flipSweepSQL,
-		c.Cfg.FlipFreshAge.String(), c.Cfg.FlipVolMin24h, c.Cfg.FlipPriceMax, c.Cfg.SnapshotTopN)
+		c.Cfg.FlipFreshAge.String(), c.Cfg.FlipVolMin24h, c.Cfg.SnapshotTopN)
 	if err != nil {
 		log.Printf("collect: flip sweep: %v", err)
 		return 0
 	}
 	defer rows.Close()
 	type flipRow struct {
-		ItemID    int     `json:"item_id"`
-		Name      string  `json:"name"`
-		High      int64   `json:"high"`
-		Low       int64   `json:"low"`
-		Margin    int64   `json:"margin"`
-		MarginPct float64 `json:"margin_pct"`
-		HighAgeS  int     `json:"high_age_s"`
-		LowAgeS   int     `json:"low_age_s"`
-		Vol24h    int64   `json:"vol24h"`
+		ItemID   int    `json:"item_id"`
+		Name     string `json:"name"`
+		High     int64  `json:"high"`
+		Low      int64  `json:"low"`
+		Margin   int64  `json:"margin"`
+		BuyLimit int64  `json:"buy_limit"`
+		GpCycle  int64  `json:"gp_cycle"`
+		HighAgeS int    `json:"high_age_s"`
+		LowAgeS  int    `json:"low_age_s"`
+		Vol24h   int64  `json:"vol24h"`
 	}
 	var parsed []flipRow
 	for rows.Next() {
 		var r flipRow
 		if err := rows.Scan(&r.ItemID, &r.Name, &r.High, &r.Low, &r.Margin,
-			&r.MarginPct, &r.HighAgeS, &r.LowAgeS, &r.Vol24h); err != nil {
+			&r.BuyLimit, &r.GpCycle, &r.HighAgeS, &r.LowAgeS, &r.Vol24h); err != nil {
 			log.Printf("collect: flip scan: %v", err)
 			return 0
 		}
 		parsed = append(parsed, r)
 	}
-	return persist(c, ctx, asOf, "flip", parsed, func(r flipRow) (int, string, bool) {
-		return r.ItemID, r.Name, r.MarginPct >= c.Cfg.FlipMarginPctMin
+	return persist(c, ctx, asOf, "vflip", parsed, func(r flipRow) (int, string, bool) {
+		return r.ItemID, r.Name, r.GpCycle >= c.Cfg.FlipGpCycleMin
+	})
+}
+
+// --- lane B: high-value flips ---
+// 10M+ items with a fresh two-sided market. Ranked by absolute post-tax
+// margin; gp_cycle = margin x the units the research budget affords
+// (bounded by buy_limit). Items the budget cannot buy one unit of are out.
+
+const highValueSweepSQL = `
+WITH latest AS (
+  SELECT DISTINCT ON (item_id) item_id, high, low, margin, high_time, low_time
+  FROM prices_1m WHERE ts >= now() - interval '2 hours'
+  ORDER BY item_id, ts DESC
+),
+vol AS (
+  SELECT item_id, sum(coalesce(high_volume,0)+coalesce(low_volume,0)) AS vol24h
+  FROM prices_5m WHERE ts >= now() - interval '24 hours' GROUP BY 1
+)
+SELECT l.item_id, i.name, l.high, l.low, l.margin,
+       i.buy_limit,
+       least(greatest(i.buy_limit,1), $4::bigint / l.low) AS units_affordable,
+       l.margin * least(greatest(i.buy_limit,1), $4::bigint / l.low) AS gp_cycle,
+       extract(epoch from (now()-l.high_time))::int AS high_age_s,
+       extract(epoch from (now()-l.low_time))::int  AS low_age_s,
+       v.vol24h
+FROM latest l JOIN vol v USING (item_id) JOIN items i USING (item_id)
+WHERE l.margin IS NOT NULL AND l.margin > 0
+  AND l.low >= $3
+  AND l.low <= $4
+  AND l.high_time >= now() - $1::interval
+  AND l.low_time  >= now() - $1::interval
+  AND v.vol24h >= $2
+ORDER BY l.margin DESC
+LIMIT $5`
+
+func (c *Collector) sweepHighValue(ctx context.Context, asOf time.Time) int {
+	rows, err := c.Store.Pool.Query(ctx, highValueSweepSQL,
+		c.Cfg.FlipFreshAge.String(), c.Cfg.HighValueVolMin24h,
+		c.Cfg.HighValueMinPrice, c.Cfg.ResearchBudgetGp, c.Cfg.SnapshotTopN)
+	if err != nil {
+		log.Printf("collect: high-value sweep: %v", err)
+		return 0
+	}
+	defer rows.Close()
+	type hvRow struct {
+		ItemID          int    `json:"item_id"`
+		Name            string `json:"name"`
+		High            int64  `json:"high"`
+		Low             int64  `json:"low"`
+		Margin          int64  `json:"margin"`
+		BuyLimit        int64  `json:"buy_limit"`
+		UnitsAffordable int64  `json:"units_affordable"`
+		GpCycle         int64  `json:"gp_cycle"`
+		HighAgeS        int    `json:"high_age_s"`
+		LowAgeS         int    `json:"low_age_s"`
+		Vol24h          int64  `json:"vol24h"`
+	}
+	var parsed []hvRow
+	for rows.Next() {
+		var r hvRow
+		if err := rows.Scan(&r.ItemID, &r.Name, &r.High, &r.Low, &r.Margin,
+			&r.BuyLimit, &r.UnitsAffordable, &r.GpCycle, &r.HighAgeS, &r.LowAgeS, &r.Vol24h); err != nil {
+			log.Printf("collect: high-value scan: %v", err)
+			return 0
+		}
+		parsed = append(parsed, r)
+	}
+	return persist(c, ctx, asOf, "hvflip", parsed, func(r hvRow) (int, string, bool) {
+		return r.ItemID, r.Name, r.GpCycle >= c.Cfg.HighValueGpCycleMin
 	})
 }
 

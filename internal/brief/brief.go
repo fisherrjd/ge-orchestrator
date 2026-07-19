@@ -26,27 +26,34 @@ type Params struct {
 	Notes         string             `json:"notes"`
 }
 
-var archetypeOrder = []string{"S", "V", "C", "U", "H"}
+// F/B are the primary lanes; S/H are retired as shippable kinds but stay in
+// the order so their paper-trade track record still renders (it is the
+// evidence for why they were retired).
+var archetypeOrder = []string{"F", "B", "V", "C", "U", "S", "H"}
 
 var archetypeNames = map[string]string{
-	"S": "seasonal window", "V": "volume anomaly", "C": "conversion",
-	"U": "update/event", "H": "swing hold",
+	"F": "volume flip", "B": "high-value flip",
+	"S": "seasonal window (retired)", "V": "volume anomaly", "C": "conversion",
+	"U": "update/event", "H": "swing hold (retired)",
 }
 
 func Defaults() Params {
 	return Params{
-		// The operator runs low-touch on a 10-30M bankroll and wants reliable
-		// gp/day: repeatable mechanical edges (S/C/H) over variance plays (V/U).
-		CapitalGp: 25_000_000, Risk: "low", MinConfidence: "medium",
-		Archetypes: map[string]float64{"S": 1.5, "V": 0.5, "C": 1.2, "U": 0.5, "H": 1},
-		// The operator's own screen, in their words: it feeds the 'flip'
-		// sweep lens and the signals it queues. The margin is the symptom to
-		// explain — a persistent fresh two-sided margin usually hides an S/V/H
-		// mechanism; the no-passive-spread-flips rule still applies.
-		Notes: "Items where instabuy AND instasell both printed within 30 min, 24h volume ≥ 200 units, " +
-			"ranked by post-tax margin, are good hunting ground (the 'flip' sweep + signals run this screen " +
-			"mechanically). Investigate WHY such a margin persists — population cycle, conversion link, " +
-			"repricing in progress — and ship that mechanism as the strategy. A margin alone is still not a thesis.",
+		// The operator runs a research engine on a 50M budget: the engine
+		// surfaces and paper-proves every option worth running at that scale;
+		// the operator picks. F/B flip lanes are primary; V/U opportunistic;
+		// S/H retired (0% confirmed at this data age); C inert (no relations
+		// table in prod).
+		CapitalGp: 50_000_000, Risk: "low", MinConfidence: "medium",
+		Archetypes: map[string]float64{"F": 1.5, "B": 1.2, "V": 0.5, "U": 0.5},
+		// The operator's own two screens, in their words: they ARE the vflip
+		// and hvflip sweep lenses. The bar for shipping a flip: margin real
+		// (fresh), persistent (reappears across the day), fillable (volume
+		// supports the size), and worth it in absolute gp (clears the floor).
+		Notes: "Volume flips: daily volume > 100k units, both sides printing within 30-60 min, weight by " +
+			"absolute margin x buy limit — evaluate how these items move through the day/week before shipping. " +
+			"Single-item flips: cost > 10M, bought and sold within 30 min, daily volume > 200 — quick but " +
+			"risky; require solid day-over-day and week-over-week trends before trusting the margin.",
 	}
 }
 
@@ -66,7 +73,7 @@ func (p *Params) Validate() error {
 	}
 	for k, w := range p.Archetypes {
 		if _, ok := archetypeNames[k]; !ok {
-			return fmt.Errorf("archetypes: unknown archetype %q (S/V/C/U/H)", k)
+			return fmt.Errorf("archetypes: unknown archetype %q (F/B/V/C/U, retired: S/H)", k)
 		}
 		if w < 0 || w > 2 {
 			return fmt.Errorf("archetypes[%s]: weight must be 0..2", k)
@@ -82,7 +89,7 @@ func Render(ctx context.Context, s *store.Store, p Params, at time.Time, assigne
 	fmt.Fprintf(&b, "_Generated %s UTC._\n\n", at.Format("2006-01-02 15:04"))
 
 	b.WriteString("### Constraints\n")
-	fmt.Fprintf(&b, "- Capital available: %s gp total. Do NOT ship any strategy whose capital_required exceeds this.\n", group(p.CapitalGp))
+	fmt.Fprintf(&b, "- Research budget: %s gp, a PER-OPPORTUNITY sizing scale — size every strategy independently against the full budget; the Open book does not drain it. No single strategy's capital_required may exceed it.\n", group(p.CapitalGp))
 	fmt.Fprintf(&b, "- Risk appetite: %s.", p.Risk)
 	if p.Members != nil {
 		if *p.Members {
@@ -102,9 +109,8 @@ func Render(ctx context.Context, s *store.Store, p Params, at time.Time, assigne
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("- Archetype S is the baseline: ship at least one S strategy or document in Discarded why every seasonal candidate failed falsification.\n")
-	b.WriteString("- Execution is LOW-TOUCH: the operator places offers at most twice a day. Every strategy must work with offers placed in advance and checked on that cadence — nothing that needs a fast reaction.\n")
-	b.WriteString("- Objective: reliable gp/day. Prefer the boring, repeatable, high-confidence edge over the bigger speculative one; ship fewer, stronger strategies.\n")
+	b.WriteString("- Objective: rank ALL viable options by absolute post-tax gp/day at fillable size. The floor is absolute (F: 200k gp/cycle, B: 100k) — dismiss below-floor candidates whatever their ROI%. Shipping NOTHING is a legitimate outcome when nothing clears the bar.\n")
+	b.WriteString("- Every F/B strategy must state its attention contract (offer cadence, longest safe unattended window, reaction risk) — the operator decides what fits their day.\n")
 
 	writeOpenBook(ctx, &b, s, p)
 	writeWatchlist(ctx, &b, s)
@@ -184,32 +190,19 @@ func Render(ctx context.Context, s *store.Store, p Params, at time.Time, assigne
 	return b.String(), nil
 }
 
-// writeOpenBook appends the live book (open + armed strategies) with its
-// committed capital, so the model dedups against it and sizes into the
-// remaining bankroll instead of re-committing the same gp every run. The
-// ship-time vetter enforces both rules mechanically; telling the model here
-// saves it from wasting a strategy slot on a doomed pitch. Best-effort: a
-// query failure just omits the section (the vetter still has the last word).
+// writeOpenBook appends the live book (open + armed strategies) so the model
+// dedups against it — informational only since the flips-first redesign:
+// capital is a per-opportunity sizing scale, not a pool the book drains.
+// Best-effort: a query failure just omits the section (the vetter still has
+// the last word on dedup).
 func writeOpenBook(ctx context.Context, b *strings.Builder, s *store.Store, p Params) {
 	open, err := s.EvaluableStrategies(ctx)
 	if err != nil {
 		return
 	}
-	var committed int64
-	for _, st := range open {
-		if st.Capital != nil {
-			committed += *st.Capital
-		}
-	}
-	remaining := p.CapitalGp - committed
-	if remaining < 0 {
-		remaining = 0
-	}
-	b.WriteString("\n### Open book (already paper-trading — dedup and capital rules are enforced at ingest)\n")
-	fmt.Fprintf(b, "- Committed capital: %s gp of %s gp; remaining for new strategies: %s gp. A strategy that does not fit the remainder is vetoed.\n",
-		group(committed), group(p.CapitalGp), group(remaining))
+	b.WriteString("\n### Open book (already paper-trading — informational: dedup is enforced at ingest, capital is NOT drained by it)\n")
 	if len(open) == 0 {
-		b.WriteString("- The book is empty — the full bankroll is available.\n")
+		b.WriteString("- The book is empty.\n")
 		return
 	}
 	b.WriteString("- Do NOT pitch an item that already has an open/armed strategy of the same archetype — it is vetoed at ingest.\n")
@@ -273,10 +266,11 @@ func firstItemName(raw json.RawMessage) string {
 // Best-effort: a missing sweep (fresh install) just omits the section.
 func writeSweep(ctx context.Context, b *strings.Builder, s *store.Store) {
 	lenses := []struct{ lens, title string }{
-		{"seasonal", "hour-of-week amplitude"},
+		{"vflip", "lane F candidates: volume flips ranked by margin x buy_limit (gp_cycle)"},
+		{"hvflip", "lane B candidates: 10M+ flips ranked by absolute post-tax margin"},
 		{"volume", "volume anomalies"},
-		{"band", "below 21d band"},
-		{"flip", "fresh two-sided post-tax margin (operator screen — explain the margin, don't just flip it)"},
+		{"seasonal", "hour-of-week amplitude (timing evidence only — not a strategy source)"},
+		{"band", "below 21d band (lane-B qualification evidence only — not a strategy source)"},
 	}
 	wrote := false
 	for _, l := range lenses {
